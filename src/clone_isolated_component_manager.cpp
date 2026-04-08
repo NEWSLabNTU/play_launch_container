@@ -214,9 +214,43 @@ std::string CloneIsolatedComponentManager::write_params_file(
         yaml << ds;
         break;
       }
-      case rcl_interfaces::msg::ParameterType::PARAMETER_STRING:
-        yaml << "'" << param.value.string_value << "'";
+      case rcl_interfaces::msg::ParameterType::PARAMETER_STRING: {
+        const auto & sv = param.value.string_value;
+        // Use YAML double-quoted style with proper escaping for strings that
+        // contain quotes, colons, or other YAML-special characters.
+        // This handles values like URDF XML or ROS message type paths (::).
+        bool needs_quoting =
+          sv.empty() || sv.find('\'') != std::string::npos || sv.find('"') != std::string::npos ||
+          sv.find(':') != std::string::npos || sv.find('#') != std::string::npos ||
+          sv.find('\n') != std::string::npos || sv.find('{') != std::string::npos ||
+          sv.find('}') != std::string::npos || sv.find('[') != std::string::npos ||
+          sv.find(']') != std::string::npos || sv.find('*') != std::string::npos ||
+          sv.find('&') != std::string::npos || sv.find('!') != std::string::npos ||
+          sv.find('|') != std::string::npos || sv.find('>') != std::string::npos ||
+          sv.find('<') != std::string::npos || sv.find('%') != std::string::npos ||
+          sv.find('+') != std::string::npos;
+        if (needs_quoting) {
+          // Escape \ and " for YAML double-quoted strings
+          yaml << '"';
+          for (char c : sv) {
+            if (c == '"') {
+              yaml << "\\\"";
+            } else if (c == '\\') {
+              yaml << "\\\\";
+            } else if (c == '\n') {
+              yaml << "\\n";
+            } else if (c == '\t') {
+              yaml << "\\t";
+            } else {
+              yaml << c;
+            }
+          }
+          yaml << '"';
+        } else {
+          yaml << "'" << sv << "'";
+        }
         break;
+      }
       case rcl_interfaces::msg::ParameterType::PARAMETER_BYTE_ARRAY: {
         yaml << "[";
         for (size_t i = 0; i < val.byte_array_value.size(); ++i) {

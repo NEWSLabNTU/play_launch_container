@@ -662,6 +662,7 @@ void CloneIsolatedComponentManager::on_load_node(
     try {
       auto child = spawn_child_process(node_id, request);
       std::string actual_name = child.node_name;
+      const int32_t child_pid = static_cast<int32_t>(child.pid);
 
       // Re-check after spawn — SIGTERM may have arrived
       if (!rclcpp::ok()) {
@@ -697,6 +698,7 @@ void CloneIsolatedComponentManager::on_load_node(
         event.full_node_name = actual_name;
         event.package_name = pkg;
         event.plugin_name = plugin;
+        event.pid = child_pid;
         event_pub_->publish(event);
       }
     } catch (const std::exception & ex) {
@@ -902,6 +904,7 @@ void CloneIsolatedComponentManager::handle_child_death(uint64_t node_id)
     event.unique_id = node_id;
     event.full_node_name = child.node_name;
     event.error_message = error_msg;
+    event.pid = static_cast<int32_t>(child.pid);
     event_pub_->publish(event);
   } catch (const std::exception & ex) {
     RCLCPP_WARN(get_logger(), "Failed to publish CRASHED event: %s", ex.what());

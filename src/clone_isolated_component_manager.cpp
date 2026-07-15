@@ -56,6 +56,44 @@ static std::string resolve_component_node_path()
   return exe_path.substr(0, slash + 1) + "component_node";
 }
 
+// starttime (clock ticks since boot) from /proc/<pid>/stat field 22.
+// Returns 0 on any parse/read failure. Field 2 (comm) may contain spaces or
+// parens, so parse from AFTER the last ')'.
+static uint64_t proc_start_time(pid_t pid)
+{
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  if (!stat_file.is_open()) {
+    return 0;
+  }
+
+  std::string line;
+  if (!std::getline(stat_file, line)) {
+    return 0;
+  }
+
+  auto close_paren = line.rfind(')');
+  if (close_paren == std::string::npos) {
+    return 0;
+  }
+
+  // Fields after ')': starting with field 3 (state). starttime is field 22
+  // overall, i.e. the 20th field counting from field 3.
+  std::istringstream rest(line.substr(close_paren + 1));
+  std::string field;
+  // Skip fields 3..21 (19 fields) to land on field 22 (starttime).
+  for (int i = 0; i < 19; ++i) {
+    if (!(rest >> field)) {
+      return 0;
+    }
+  }
+
+  uint64_t starttime = 0;
+  if (!(rest >> starttime)) {
+    return 0;
+  }
+  return starttime;
+}
+
 // ── Constructor / Destructor ────────────────────────────────────────────
 
 CloneIsolatedComponentManager::CloneIsolatedComponentManager(
@@ -663,6 +701,7 @@ void CloneIsolatedComponentManager::on_load_node(
       auto child = spawn_child_process(node_id, request);
       std::string actual_name = child.node_name;
       const int32_t child_pid = static_cast<int32_t>(child.pid);
+      const uint64_t child_start_time = proc_start_time(child.pid);
 
       // Re-check after spawn — SIGTERM may have arrived
       if (!rclcpp::ok()) {
@@ -699,6 +738,7 @@ void CloneIsolatedComponentManager::on_load_node(
         event.package_name = pkg;
         event.plugin_name = plugin;
         event.pid = child_pid;
+        event.start_time = child_start_time;
         event_pub_->publish(event);
       }
     } catch (const std::exception & ex) {

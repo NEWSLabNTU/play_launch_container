@@ -756,9 +756,16 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   constexpr int kPollSliceMs = 1000;
   constexpr int kProgressEverySec = 15;
 
+  // Why the wait ended. Recorded at each exit rather than reconstructed
+  // afterwards: a post-hoc `waitpid` cannot tell a dead child from a reaped
+  // one — with SIGCHLD auto-reaping it returns ECHILD either way — and
+  // guessing produced the exact misreport this replaces, blaming an expired
+  // PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS on a run where none was set.
+  enum class WaitOutcome { Ready, ChildGone, Deadline, PollError };
+  WaitOutcome outcome = WaitOutcome::PollError;
+
   std::string ready_buf;
   bool got_response = false;
-  bool child_died = false;
   int waited_ms = 0;
 
   while (true) {
@@ -767,22 +774,23 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
       if (errno == EINTR) {
         continue;
       }
-      break;  // poll error
+      outcome = WaitOutcome::PollError;
+      break;
     }
     if (ret == 0) {
       waited_ms += kPollSliceMs;
 
-      // Liveness is the real bound. waitpid is authoritative: the pipe tells us
-      // about a file descriptor, and a child can exit without EOF being
-      // visible yet.
-      int status = 0;
-      if (waitpid(child_pid, &status, WNOHANG) == child_pid) {
-        child_died = true;
+      // Liveness is the real bound. `kill(pid, 0)` rather than `waitpid`,
+      // because it answers "does this process still exist" whether or not it
+      // has been reaped.
+      if (kill(child_pid, 0) != 0 && errno == ESRCH) {
+        outcome = WaitOutcome::ChildGone;
         break;
       }
 
       if (kReadyTimeoutMs > 0 && waited_ms >= kReadyTimeoutMs) {
-        break;  // operator asked for a deadline
+        outcome = WaitOutcome::Deadline;
+        break;
       }
 
       // Say what is happening. A constructor that runs for minutes is
@@ -799,12 +807,18 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
     char buf[1024];
     ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
     if (n <= 0) {
-      break;  // EOF — child gone — or error
+      // EOF: every write end is closed, which for a child that never reported
+      // means it is gone. This is the usual way a death is noticed — the poll
+      // wakes readable rather than timing out — which is why the liveness
+      // check above is not enough on its own.
+      outcome = WaitOutcome::ChildGone;
+      break;
     }
     buf[n] = '\0';
     ready_buf += buf;
     if (ready_buf.find('\n') != std::string::npos) {
       got_response = true;
+      outcome = WaitOutcome::Ready;
       break;
     }
   }
@@ -819,22 +833,33 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   // Parse response
   std::string node_name;
   if (!got_response || ready_buf.empty()) {
-    // Child died or timed out before responding
-    kill(child_pid, SIGKILL);
-    waitpid(child_pid, nullptr, 0);
+    // `outcome` was recorded where the wait ended, so nothing is inferred
+    // here. Only signal a child that is still there: once gone, that pid may
+    // already belong to something else.
+    if (outcome != WaitOutcome::ChildGone) {
+      kill(child_pid, SIGKILL);
+      waitpid(child_pid, nullptr, 0);
+    }
     if (!param_file.empty()) {
       unlink(param_file.c_str());
     }
+
     // Name which of the two happened. "timeout or crash" merged a node killed
-    // at a deadline with one that segfaulted in its constructor, and that
-    // ambiguity sent the first investigation of issue 0019 down the wrong path.
-    if (child_died) {
-      throw std::runtime_error("component_node exited during construction");
+    // at a deadline with one that died in its constructor, and that ambiguity
+    // sent the first investigation of issue 0019 down the wrong path.
+    switch (outcome) {
+      case WaitOutcome::ChildGone:
+        throw std::runtime_error(
+          "component_node exited during construction after " + std::to_string(waited_ms / 1000) +
+          "s (check the component's own stderr in the load_node log directory)");
+      case WaitOutcome::Deadline:
+        throw std::runtime_error(
+          "component_node still constructing after " + std::to_string(waited_ms / 1000) +
+          "s when PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS expired (it was alive; unset the "
+          "variable to wait as long as it stays alive)");
+      default:
+        throw std::runtime_error("component_node ready pipe failed while waiting for it");
     }
-    throw std::runtime_error(
-      "component_node still constructing after " + std::to_string(waited_ms / 1000) +
-      "s when PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS expired (it was alive; unset the "
-      "variable to wait as long as it stays alive)");
   }
 
   // Trim trailing newline

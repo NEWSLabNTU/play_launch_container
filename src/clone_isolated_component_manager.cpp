@@ -178,16 +178,28 @@ static int ready_timeout_ms()
     errno = 0;
     char * end = nullptr;
     const long parsed = std::strtol(env, &end, 10);
-    if (errno == 0 && end != env && *end == '\0' && parsed > 0 && parsed <= 3600000) {
+    if (errno == 0 && end != env && *end == '\0' && parsed >= 0 && parsed <= 3600000) {
       return static_cast<int>(parsed);
     }
     fprintf(
       stderr,
       "[play_launch_container] ignoring PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS='%s' "
-      "(want an integer number of milliseconds in 1..3600000)\n",
+      "(want an integer number of milliseconds in 0..3600000, 0 for no deadline)\n",
       env);
   }
-  return 30000;
+  // No deadline. There is no number that is right on every platform: the wait
+  // covers the node's CONSTRUCTOR, and a first-run TensorRT engine build takes
+  // however long that machine's GPU takes — measured at ~33s cold and ~45s even
+  // with the engine cached for Autoware's traffic light classifier, on one
+  // board. A fixed default is a guess about hardware we do not have, and when
+  // it is wrong it does not degrade: it SIGKILLs the node partway through work
+  // that is proceeding normally, discards it (the .engine is written last), and
+  // does the same on every relaunch.
+  //
+  // So the wait is bounded by LIVENESS instead of by time — see the poll loop,
+  // which gives up the moment the child dies and otherwise reports progress.
+  // Set the variable to bound a node that wedges rather than works.
+  return 0;
 }
 
 // starttime (clock ticks since boot) from /proc/<pid>/stat field 22.
@@ -730,27 +742,64 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   // ── Parent process ──
   close(pipefd[1]);  // close write end
 
-  // Read ready message from pipe with timeout
+  // Wait for the child to report ready. This covers its CONSTRUCTOR, so it can
+  // legitimately run for minutes; see ready_timeout_ms() for why there is no
+  // default deadline.
   struct pollfd pfd
   {
   };
   pfd.fd = pipefd[0];
   pfd.events = POLLIN;
-  const int kReadyTimeoutMs = ready_timeout_ms();
+  const int kReadyTimeoutMs = ready_timeout_ms();  // 0 = no deadline
+
+  // Poll in slices so liveness and progress can be checked while waiting.
+  constexpr int kPollSliceMs = 1000;
+  constexpr int kProgressEverySec = 15;
 
   std::string ready_buf;
   bool got_response = false;
+  bool child_died = false;
+  int waited_ms = 0;
 
   while (true) {
-    int ret = poll(&pfd, 1, kReadyTimeoutMs);
-    if (ret <= 0) {
-      // Timeout or error
-      break;
+    int ret = poll(&pfd, 1, kPollSliceMs);
+    if (ret < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      break;  // poll error
     }
+    if (ret == 0) {
+      waited_ms += kPollSliceMs;
+
+      // Liveness is the real bound. waitpid is authoritative: the pipe tells us
+      // about a file descriptor, and a child can exit without EOF being
+      // visible yet.
+      int status = 0;
+      if (waitpid(child_pid, &status, WNOHANG) == child_pid) {
+        child_died = true;
+        break;
+      }
+
+      if (kReadyTimeoutMs > 0 && waited_ms >= kReadyTimeoutMs) {
+        break;  // operator asked for a deadline
+      }
+
+      // Say what is happening. A constructor that runs for minutes is
+      // indistinguishable from a hang unless something reports it, and that
+      // ambiguity is what made the old fixed timeout look reasonable.
+      if (waited_ms % (kProgressEverySec * 1000) == 0) {
+        RCLCPP_INFO(
+          get_logger(), "Component '%s' constructing for %ds (pid %d, alive)",
+          request->plugin_name.c_str(), waited_ms / 1000, child_pid);
+      }
+      continue;
+    }
+
     char buf[1024];
     ssize_t n = read(pipefd[0], buf, sizeof(buf) - 1);
     if (n <= 0) {
-      break;  // EOF or error
+      break;  // EOF — child gone — or error
     }
     buf[n] = '\0';
     ready_buf += buf;
@@ -761,6 +810,12 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   }
   close(pipefd[0]);
 
+  if (got_response && waited_ms >= kProgressEverySec * 1000) {
+    RCLCPP_INFO(
+      get_logger(), "Component '%s' finished constructing after %ds",
+      request->plugin_name.c_str(), waited_ms / 1000);
+  }
+
   // Parse response
   std::string node_name;
   if (!got_response || ready_buf.empty()) {
@@ -770,7 +825,16 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
     if (!param_file.empty()) {
       unlink(param_file.c_str());
     }
-    throw std::runtime_error("component_node did not respond (timeout or crash)");
+    // Name which of the two happened. "timeout or crash" merged a node killed
+    // at a deadline with one that segfaulted in its constructor, and that
+    // ambiguity sent the first investigation of issue 0019 down the wrong path.
+    if (child_died) {
+      throw std::runtime_error("component_node exited during construction");
+    }
+    throw std::runtime_error(
+      "component_node still constructing after " + std::to_string(waited_ms / 1000) +
+      "s when PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS expired (it was alive; unset the "
+      "variable to wait as long as it stays alive)");
   }
 
   // Trim trailing newline

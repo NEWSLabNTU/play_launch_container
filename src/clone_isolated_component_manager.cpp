@@ -26,6 +26,7 @@
 
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -54,6 +55,41 @@ static std::string resolve_component_node_path()
     return "component_node";
   }
   return exe_path.substr(0, slash + 1) + "component_node";
+}
+
+// ── Helper: how long to wait for a forked component to report ready ─────
+//
+// A component's constructor runs before it can answer, and some of them take
+// far longer than a service call normally would: Autoware's traffic light
+// classifier spends ~33s building a TensorRT engine from ONNX on a cold cache
+// and ~45s of wall clock even with the engine cached. At the former fixed 30s
+// this manager SIGKILLed the child seconds before it would have reported, the
+// LoadNode retry forked a fresh child that died the same way, and the node
+// simply never existed -- with the rest of the pipeline up and publishing empty
+// results, which is a hard failure to read from the outside.
+//
+// The default stays 30s so nothing changes for anyone not asking. Set
+// PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS to raise it for stacks that load
+// inference models. Note this is the *first* wait: the Rust side already
+// budgets 60s per retry and up to 600s total for exactly these slow
+// constructors, so a 30s hard kill here undercuts that design.
+static int ready_timeout_ms()
+{
+  const char * env = std::getenv("PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS");
+  if (env != nullptr && *env != '\0') {
+    errno = 0;
+    char * end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0 && parsed <= 3600000) {
+      return static_cast<int>(parsed);
+    }
+    fprintf(
+      stderr,
+      "[play_launch_container] ignoring PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS='%s' "
+      "(want an integer number of milliseconds in 1..3600000)\n",
+      env);
+  }
+  return 30000;
 }
 
 // starttime (clock ticks since boot) from /proc/<pid>/stat field 22.
@@ -539,7 +575,7 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   };
   pfd.fd = pipefd[0];
   pfd.events = POLLIN;
-  constexpr int kReadyTimeoutMs = 30000;  // 30s matches LoadNode service timeout
+  const int kReadyTimeoutMs = ready_timeout_ms();
 
   std::string ready_buf;
   bool got_response = false;

@@ -24,13 +24,17 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <thread>
 #include <utility>
 
 namespace play_launch_container
@@ -73,6 +77,100 @@ static std::string resolve_component_node_path()
 // inference models. Note this is the *first* wait: the Rust side already
 // budgets 60s per retry and up to 600s total for exactly these slow
 // constructors, so a 30s hard kill here undercuts that design.
+// ── Helper: how many spawn workers, and when a spawn may proceed ────────
+//
+// The worker pool used to be a fixed 4, and that number was the real limit on
+// how fast a container could bring its composables up: each worker is held for
+// the whole of a child's CONSTRUCTOR, so five slow constructors ran in two
+// waves regardless of what the machine could have done. Measured with a 20 s
+// constructor: six of them plus one fast node landed at t+20s (x4) and t+40s
+// (x2) — two waves, purely from the pool.
+//
+// That matters on a perception stack. Autoware's camera-LiDAR-fusion preset
+// puts SIX TensorRT-loading components in the traffic light container alone,
+// each ~45 s of construction with the engine cached.
+//
+// A count is the wrong governor for this. It cannot tell a component that is
+// slow because it is COMPUTING (a TensorRT build: CPU-hungry, memory-hungry,
+// and on Tegra its GPU allocations come out of system RAM — genuinely worth
+// throttling) from one that is slow because it is WAITING (on discovery, on a
+// service, on a parameter server — costing nothing while it holds a slot). So
+// the pool is sized to stay out of the way, and admission is governed by what
+// is actually scarce: free memory.
+static size_t spawn_worker_count()
+{
+  const char * env = std::getenv("PLAY_LAUNCH_SPAWN_WORKERS");
+  if (env != nullptr && *env != '\0') {
+    errno = 0;
+    char * end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed > 0 && parsed <= 256) {
+      return static_cast<size_t>(parsed);
+    }
+    fprintf(
+      stderr,
+      "[play_launch_container] ignoring PLAY_LAUNCH_SPAWN_WORKERS='%s' "
+      "(want an integer in 1..256)\n",
+      env);
+  }
+  const unsigned hw = std::thread::hardware_concurrency();
+  const size_t n = (hw == 0) ? 4u : static_cast<size_t>(hw);
+  // Enough that the pool is not the limiter; the memory gate below is.
+  return std::min<size_t>(std::max<size_t>(n, 4), 32);
+}
+
+/// MemAvailable in kB, or -1 if it cannot be read.
+static long mem_available_kb()
+{
+  std::ifstream f("/proc/meminfo");
+  std::string key;
+  long value = 0;
+  std::string unit;
+  while (f >> key >> value >> unit) {
+    if (key == "MemAvailable:") {
+      return value;
+    }
+  }
+  return -1;
+}
+
+/// Free-memory floor below which a spawn waits, in kB. 0 disables the gate.
+///
+/// Absolute rather than a share of RAM, for the same reason play_launch's own
+/// process floor is: what it guards against is one more child allocating
+/// before the next check, and a component needs what it needs regardless of
+/// how big the machine is. Capped at a quarter of RAM so a small board is not
+/// asked to keep more free than it has.
+static long spawn_floor_kb()
+{
+  const char * env = std::getenv("PLAY_LAUNCH_SPAWN_MIN_AVAIL_MB");
+  if (env != nullptr && *env != '\0') {
+    errno = 0;
+    char * end = nullptr;
+    const long parsed = std::strtol(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed >= 0 && parsed <= 1024L * 1024L) {
+      return parsed * 1024L;  // MB -> kB; 0 disables
+    }
+    fprintf(
+      stderr,
+      "[play_launch_container] ignoring PLAY_LAUNCH_SPAWN_MIN_AVAIL_MB='%s' "
+      "(want an integer number of MB, 0 to disable)\n",
+      env);
+  }
+
+  constexpr long kDefaultFloorKb = 1024L * 1024L;  // 1 GiB
+  std::ifstream f("/proc/meminfo");
+  std::string key;
+  long value = 0;
+  std::string unit;
+  while (f >> key >> value >> unit) {
+    if (key == "MemTotal:") {
+      return std::min(kDefaultFloorKb, value / 4);
+    }
+  }
+  return kDefaultFloorKb;
+}
+
 static int ready_timeout_ms()
 {
   const char * env = std::getenv("PLAY_LAUNCH_COMPONENT_READY_TIMEOUT_MS");
@@ -144,7 +242,8 @@ CloneIsolatedComponentManager::CloneIsolatedComponentManager(
 
   // Start worker thread pool for async node spawning
   workers_running_ = true;
-  for (size_t i = 0; i < kWorkerThreadCount; ++i) {
+  const size_t worker_count = spawn_worker_count();
+  for (size_t i = 0; i < worker_count; ++i) {
     worker_threads_.emplace_back(&CloneIsolatedComponentManager::worker_loop, this);
   }
 
@@ -219,6 +318,68 @@ CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
 }
 
 // ── Worker thread pool ──────────────────────────────────────────────────
+
+// Wait until there is room in memory for another child.
+//
+// Serialised on a mutex so the check and the fork that follows it are not
+// raced by every other worker: without that, N workers all observe the same
+// MemAvailable, all conclude there is room, and all fork — the gate reads as
+// satisfied exactly once and then admits everyone. Holding the mutex costs
+// microseconds when memory is plentiful, because the first check passes and
+// nothing sleeps.
+//
+// Never blocks forever. A launch that will not start is worse than one that
+// starts under pressure, so after `kMaxWaitMs` the spawn proceeds with a
+// warning naming the condition — the same rule play_launch applies to its own
+// admission gates.
+void CloneIsolatedComponentManager::await_spawn_capacity(const std::string & plugin)
+{
+  const long floor_kb = spawn_floor_kb();
+  if (floor_kb <= 0) {
+    return;  // gate disabled
+  }
+
+  constexpr int kPollMs = 250;
+  constexpr int kMaxWaitMs = 120000;
+  constexpr int kProgressEveryMs = 15000;
+
+  std::lock_guard<std::mutex> admit(spawn_admit_mutex_);
+
+  int waited_ms = 0;
+  bool waited = false;
+  while (true) {
+    const long avail = mem_available_kb();
+    if (avail < 0) {
+      return;  // cannot measure; do not pretend to govern
+    }
+    if (avail >= floor_kb) {
+      break;
+    }
+    waited = true;
+    if (waited_ms >= kMaxWaitMs) {
+      RCLCPP_WARN(
+        get_logger(),
+        "Spawning '%s' with only %ld MiB available (floor %ld MiB) after waiting %ds — "
+        "proceeding rather than stalling the launch",
+        plugin.c_str(), avail / 1024, floor_kb / 1024, waited_ms / 1000);
+      break;
+    }
+    if (waited_ms % kProgressEveryMs == 0) {
+      RCLCPP_INFO(
+        get_logger(), "Holding spawn of '%s': %ld MiB available, want %ld MiB", plugin.c_str(),
+        avail / 1024, floor_kb / 1024);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+    waited_ms += kPollMs;
+  }
+
+  // Only when memory was actually tight: give the child just admitted a moment
+  // to show up in MemAvailable, so the next caller measures the world it is
+  // really entering. Skipped entirely on the common path.
+  if (waited) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
+  }
+}
 
 void CloneIsolatedComponentManager::worker_loop()
 {
@@ -734,6 +895,7 @@ void CloneIsolatedComponentManager::on_load_node(
     }
 
     try {
+      await_spawn_capacity(plugin);
       auto child = spawn_child_process(node_id, request);
       std::string actual_name = child.node_name;
       const int32_t child_pid = static_cast<int32_t>(child.pid);

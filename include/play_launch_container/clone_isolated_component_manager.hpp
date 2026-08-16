@@ -116,7 +116,16 @@ private:
   std::condition_variable work_queue_cv_;
   std::queue<std::function<void()>> work_queue_;
   std::atomic<bool> workers_running_{false};
-  static constexpr size_t kWorkerThreadCount = 4;
+  /// Serialises spawn admission so the memory check and the fork it guards
+  /// are not raced by every other worker (see `await_spawn_capacity`).
+  std::mutex spawn_admit_mutex_;
+
+  /// Block until there is memory headroom for another child, or until the
+  /// wait cap expires. This is the governor for spawn concurrency: the worker
+  /// pool is deliberately sized not to be the limit, because a count cannot
+  /// tell a component that is slow because it is computing from one that is
+  /// slow because it is waiting.
+  void await_spawn_capacity(const std::string & plugin);
 
   // Track nodes with unique_id assigned but not yet constructed
   std::set<uint64_t> pending_node_ids_;

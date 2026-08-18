@@ -827,8 +827,8 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
 
   if (got_response && waited_ms >= kProgressEverySec * 1000) {
     RCLCPP_INFO(
-      get_logger(), "Component '%s' finished constructing after %ds",
-      request->plugin_name.c_str(), waited_ms / 1000);
+      get_logger(), "Component '%s' finished constructing after %ds", request->plugin_name.c_str(),
+      waited_ms / 1000);
   }
 
   // Parse response

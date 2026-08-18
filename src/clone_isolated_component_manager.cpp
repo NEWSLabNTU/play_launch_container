@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -103,7 +104,7 @@ static size_t spawn_worker_count()
   if (env != nullptr && *env != '\0') {
     errno = 0;
     char * end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
+    const int64_t parsed = std::strtoll(env, &end, 10);
     if (errno == 0 && end != env && *end == '\0' && parsed > 0 && parsed <= 256) {
       return static_cast<size_t>(parsed);
     }
@@ -120,11 +121,11 @@ static size_t spawn_worker_count()
 }
 
 /// MemAvailable in kB, or -1 if it cannot be read.
-static long mem_available_kb()
+static int64_t mem_available_kb()
 {
   std::ifstream f("/proc/meminfo");
   std::string key;
-  long value = 0;
+  int64_t value = 0;
   std::string unit;
   while (f >> key >> value >> unit) {
     if (key == "MemAvailable:") {
@@ -141,14 +142,14 @@ static long mem_available_kb()
 /// before the next check, and a component needs what it needs regardless of
 /// how big the machine is. Capped at a quarter of RAM so a small board is not
 /// asked to keep more free than it has.
-static long spawn_floor_kb()
+static int64_t spawn_floor_kb()
 {
   const char * env = std::getenv("PLAY_LAUNCH_SPAWN_MIN_AVAIL_MB");
   if (env != nullptr && *env != '\0') {
     errno = 0;
     char * end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
-    if (errno == 0 && end != env && *end == '\0' && parsed >= 0 && parsed <= 1024L * 1024L) {
+    const int64_t parsed = std::strtoll(env, &end, 10);
+    if (errno == 0 && end != env && *end == '\0' && parsed >= 0 && parsed <= 1024LL * 1024LL) {
       return parsed * 1024L;  // MB -> kB; 0 disables
     }
     fprintf(
@@ -158,10 +159,10 @@ static long spawn_floor_kb()
       env);
   }
 
-  constexpr long kDefaultFloorKb = 1024L * 1024L;  // 1 GiB
+  constexpr int64_t kDefaultFloorKb = 1024LL * 1024LL;  // 1 GiB
   std::ifstream f("/proc/meminfo");
   std::string key;
-  long value = 0;
+  int64_t value = 0;
   std::string unit;
   while (f >> key >> value >> unit) {
     if (key == "MemTotal:") {
@@ -177,7 +178,7 @@ static int ready_timeout_ms()
   if (env != nullptr && *env != '\0') {
     errno = 0;
     char * end = nullptr;
-    const long parsed = std::strtol(env, &end, 10);
+    const int64_t parsed = std::strtoll(env, &end, 10);
     if (errno == 0 && end != env && *end == '\0' && parsed >= 0 && parsed <= 3600000) {
       return static_cast<int>(parsed);
     }
@@ -346,7 +347,7 @@ CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
 // admission gates.
 void CloneIsolatedComponentManager::await_spawn_capacity(const std::string & plugin)
 {
-  const long floor_kb = spawn_floor_kb();
+  const int64_t floor_kb = spawn_floor_kb();
   if (floor_kb <= 0) {
     return;  // gate disabled
   }
@@ -360,7 +361,7 @@ void CloneIsolatedComponentManager::await_spawn_capacity(const std::string & plu
   int waited_ms = 0;
   bool waited = false;
   while (true) {
-    const long avail = mem_available_kb();
+    const int64_t avail = mem_available_kb();
     if (avail < 0) {
       return;  // cannot measure; do not pretend to govern
     }

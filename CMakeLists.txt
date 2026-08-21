@@ -14,12 +14,25 @@ find_package(ament_index_cpp REQUIRED)
 # Shared library (both component manager classes)
 add_library(observable_component_manager SHARED
   src/observable_component_manager.cpp
-  src/clone_isolated_component_manager.cpp)
+  src/clone_isolated_component_manager.cpp
+  src/control_channel.cpp
+  src/control_json.cpp)
 target_include_directories(observable_component_manager PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 ament_target_dependencies(observable_component_manager
   rclcpp rclcpp_components composition_interfaces play_launch_msgs)
+
+# Phase 64: control-channel unit tests (JSON codec + framing invariants).
+if(BUILD_TESTING)
+  find_package(ament_cmake_gtest QUIET)
+  if(ament_cmake_gtest_FOUND)
+    ament_add_gtest(test_control_json test/test_control_json.cpp)
+    if(TARGET test_control_json)
+      target_link_libraries(test_control_json observable_component_manager)
+    endif()
+  endif()
+endif()
 
 # SlowLoader test component (shared library for composition)
 add_library(slow_loader SHARED src/slow_loader.cpp)

@@ -241,6 +241,47 @@ static uint64_t proc_start_time(pid_t pid)
   return starttime;
 }
 
+// CPU time (utime+stime) of a process in milliseconds, or 0 if unreadable.
+//
+// This is the evidence half of the stall question. A constructor burning CPU
+// is working; one burning none MIGHT be wedged, and might equally be blocked
+// on a service that has not come up yet — which is the ordinary shape of an
+// Autoware startup. So the container reports it and never acts on it.
+static uint64_t proc_cpu_ms(pid_t pid)
+{
+  std::ifstream stat_file("/proc/" + std::to_string(pid) + "/stat");
+  if (!stat_file.is_open()) {
+    return 0;
+  }
+  std::string line;
+  if (!std::getline(stat_file, line)) {
+    return 0;
+  }
+  const auto close_paren = line.rfind(')');
+  if (close_paren == std::string::npos) {
+    return 0;
+  }
+  // Fields after ')' start at field 3. utime is field 14, stime is field 15,
+  // i.e. the 12th and 13th counting from field 3.
+  std::istringstream rest(line.substr(close_paren + 1));
+  std::string field;
+  for (int i = 0; i < 11; ++i) {
+    if (!(rest >> field)) {
+      return 0;
+    }
+  }
+  uint64_t utime = 0;
+  uint64_t stime = 0;
+  if (!(rest >> utime >> stime)) {
+    return 0;
+  }
+  const long ticks = sysconf(_SC_CLK_TCK);
+  if (ticks <= 0) {
+    return 0;
+  }
+  return ((utime + stime) * 1000ULL) / static_cast<uint64_t>(ticks);
+}
+
 // ── Constructor / Destructor ────────────────────────────────────────────
 
 CloneIsolatedComponentManager::CloneIsolatedComponentManager(
@@ -290,6 +331,13 @@ CloneIsolatedComponentManager::CloneIsolatedComponentManager(
 
 CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
 {
+  // Phase 64: close the control channel before anything else. Its reader
+  // thread calls handle_control_load on this object, and `stop()` joins that
+  // thread — after which no load can arrive into a half-destroyed manager.
+  if (control_) {
+    control_->stop();
+  }
+
   // Stop worker threads first (they may hold load_mutex_)
   {
     std::lock_guard<std::mutex> lock(work_queue_mutex_);
@@ -345,7 +393,8 @@ CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
 // starts under pressure, so after `kMaxWaitMs` the spawn proceeds with a
 // warning naming the condition — the same rule play_launch applies to its own
 // admission gates.
-void CloneIsolatedComponentManager::await_spawn_capacity(const std::string & plugin)
+void CloneIsolatedComponentManager::await_spawn_capacity(
+  uint64_t node_id, const std::string & plugin)
 {
   const int64_t floor_kb = spawn_floor_kb();
   if (floor_kb <= 0) {
@@ -381,6 +430,14 @@ void CloneIsolatedComponentManager::await_spawn_capacity(const std::string & plu
       RCLCPP_INFO(
         get_logger(), "Holding spawn of '%s': %ld MiB available, want %ld MiB", plugin.c_str(),
         avail / 1024, floor_kb / 1024);
+      // Phase 64 W2: say it on the socket too. Nothing has been forked yet, so
+      // there is no pid and no liveness to report — `queued` IS the report,
+      // and without it this two-minute window looks identical to a load that
+      // was never received.
+      if (control_) {
+        control_->send_constructing(
+          node_id, 0, static_cast<uint64_t>(waited_ms), plugin, LoadPhase::Queued, 0);
+      }
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(kPollMs));
     waited_ms += kPollMs;
@@ -743,6 +800,10 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   // ── Parent process ──
   close(pipefd[1]);  // close write end
 
+  // The child exists: the load has left `queued` and a query can now be
+  // answered with a pid.
+  note_constructing(node_id, child_pid);
+
   // Wait for the child to report ready. This covers its CONSTRUCTOR, so it can
   // legitimately run for minutes; see ready_timeout_ms() for why there is no
   // default deadline.
@@ -801,6 +862,15 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
         RCLCPP_INFO(
           get_logger(), "Component '%s' constructing for %ds (pid %d, alive)",
           request->plugin_name.c_str(), waited_ms / 1000, child_pid);
+        // Phase 64: say the same thing to play_launch. This is what makes a
+        // slow constructor distinguishable from a wedged one at the
+        // supervisor, instead of both looking like a load that has not
+        // reported within some timeout.
+        if (control_) {
+          control_->send_constructing(
+            node_id, child_pid, static_cast<uint64_t>(waited_ms), request->plugin_name,
+            LoadPhase::Constructing, proc_cpu_ms(child_pid));
+        }
       }
       continue;
     }
@@ -905,6 +975,215 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   return ChildInfo{child_pid, pidfd, node_id, node_name, param_file};
 }
 
+bool CloneIsolatedComponentManager::plugin_available(
+  const std::string & package, const std::string & plugin)
+{
+  // Look up component resources (ament index, fast).
+  //
+  // This THROWS for a package with no component resources at all, which is
+  // indistinguishable to a caller from a package whose plugin list simply
+  // does not contain `plugin` — so report both the same way. On the service
+  // path an escaping exception would leave the executor; on the control-socket
+  // path it would reach the top of the reader thread. Neither is a reason to
+  // lose a container over a misspelled package name.
+  try {
+    for (const auto & resource : get_component_resources(package)) {
+      if (resource.first == plugin) {
+        return true;
+      }
+    }
+  } catch (const std::exception & ex) {
+    RCLCPP_ERROR(
+      get_logger(), "Failed to list components of package '%s': %s", package.c_str(), ex.what());
+  }
+  return false;
+}
+
+uint64_t CloneIsolatedComponentManager::reserve_node_id(uint64_t seq, const std::string & plugin)
+{
+  uint64_t node_id;
+  {
+    std::lock_guard<std::mutex> lock(load_mutex_);
+    node_id = unique_id_++;
+    if (0 == node_id) {
+      throw std::overflow_error("exhausted the unique ids for components in this process");
+    }
+  }
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    PendingLoad pending;
+    pending.seq = seq;
+    pending.plugin = plugin;
+    pending.phase = LoadPhase::Queued;
+    pending.started = std::chrono::steady_clock::now();
+    pending_loads_.emplace(node_id, std::move(pending));
+    if (seq != 0) {
+      seq_to_id_[seq] = node_id;
+    }
+  }
+  return node_id;
+}
+
+void CloneIsolatedComponentManager::note_constructing(uint64_t node_id, pid_t pid)
+{
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  auto it = pending_loads_.find(node_id);
+  if (it != pending_loads_.end()) {
+    it->second.phase = LoadPhase::Constructing;
+    it->second.pid = pid;
+  }
+}
+
+bool CloneIsolatedComponentManager::take_pending(uint64_t node_id, std::string * cancel_reason)
+{
+  std::lock_guard<std::mutex> lock(pending_mutex_);
+  auto it = pending_loads_.find(node_id);
+  if (it == pending_loads_.end()) {
+    return false;
+  }
+  const bool cancelled = it->second.cancelled;
+  if (cancelled && cancel_reason != nullptr) {
+    *cancel_reason = it->second.cancel_reason;
+  }
+  pending_loads_.erase(it);
+  return cancelled;
+}
+
+void CloneIsolatedComponentManager::submit_spawn(
+  uint64_t node_id, const std::shared_ptr<LoadNode::Request> & request)
+{
+  auto pkg = request->package_name;
+  auto plugin = request->plugin_name;
+
+  submit_work([this, request, node_id, pkg, plugin]() {
+    // Guard: if shutdown already started, skip spawn entirely.
+    if (!rclcpp::ok()) {
+      take_pending(node_id, nullptr);
+      return;
+    }
+
+    try {
+      await_spawn_capacity(node_id, plugin);
+
+      // A cancel that arrived while this load sat behind the memory gate is
+      // honoured HERE, before the fork — the cheapest place to stop, and the
+      // one that makes "cancelled" mean the same thing whether or not a child
+      // ever existed.
+      {
+        std::string reason;
+        bool cancelled = false;
+        {
+          std::lock_guard<std::mutex> lock(pending_mutex_);
+          auto it = pending_loads_.find(node_id);
+          if (it != pending_loads_.end() && it->second.cancelled) {
+            cancelled = true;
+            reason = it->second.cancel_reason;
+            pending_loads_.erase(it);
+          }
+        }
+        if (cancelled) {
+          RCLCPP_INFO(
+            get_logger(), "Load of '%s' (id %lu) cancelled before spawn: %s", plugin.c_str(),
+            static_cast<uint64_t>(node_id), reason.c_str());
+          if (control_) {
+            control_->send_load_failed(node_id, "cancelled before spawn: " + reason, true);
+          }
+          return;
+        }
+      }
+
+      auto child = spawn_child_process(node_id, request);
+      std::string actual_name = child.node_name;
+      const int32_t child_pid = static_cast<int32_t>(child.pid);
+      const uint64_t child_start_time = proc_start_time(child.pid);
+
+      // Re-check after spawn — SIGTERM may have arrived
+      if (!rclcpp::ok()) {
+        RCLCPP_DEBUG(
+          get_logger(), "Shutdown during spawn of '%s' (id %lu), killing child", plugin.c_str(),
+          static_cast<uint64_t>(node_id));
+        cleanup_child(child);
+        take_pending(node_id, nullptr);
+        return;
+      }
+
+      {
+        std::lock_guard<std::mutex> lock(children_mutex_);
+        children_[node_id] = std::move(child);
+      }
+
+      take_pending(node_id, nullptr);
+
+      RCLCPP_INFO(
+        get_logger(), "Component '%s' loaded as '%s' (id %lu)", plugin.c_str(), actual_name.c_str(),
+        static_cast<uint64_t>(node_id));
+
+      // Phase 64: the private channel first — it is ordered, lossless and
+      // does not queue behind a startup's worth of DDS discovery, which is
+      // the whole reason it exists.
+      if (control_) {
+        control_->send_loaded(node_id, actual_name, child_pid, child_start_time);
+      }
+
+      // Publish LOADED event
+      if (rclcpp::ok()) {
+        auto event = play_launch_msgs::msg::ComponentEvent();
+        event.stamp = now();
+        event.event_type = play_launch_msgs::msg::ComponentEvent::LOADED;
+        event.unique_id = node_id;
+        event.full_node_name = actual_name;
+        event.package_name = pkg;
+        event.plugin_name = plugin;
+        event.pid = child_pid;
+        event.start_time = child_start_time;
+        event_pub_->publish(event);
+      }
+    } catch (const std::exception & ex) {
+      std::string cancel_reason;
+      const bool cancelled = take_pending(node_id, &cancel_reason);
+
+      if (!rclcpp::ok()) {
+        RCLCPP_DEBUG(
+          get_logger(), "Spawn interrupted by shutdown for '%s' (id %lu)", plugin.c_str(),
+          static_cast<uint64_t>(node_id));
+        return;
+      }
+
+      // A child killed by `handle_control_cancel` dies during construction and
+      // surfaces here as an exception. Reporting that as an unexplained death
+      // would be a lie by omission — and the supervisor needs the
+      // `cancelled` flag, because a confirmed cancellation is the one thing
+      // that makes a resend safe.
+      const std::string error =
+        cancelled ? ("cancelled during construction: " + cancel_reason) : std::string(ex.what());
+
+      if (cancelled) {
+        RCLCPP_INFO(
+          get_logger(), "Load of '%s' (id %lu) cancelled: %s", plugin.c_str(),
+          static_cast<uint64_t>(node_id), cancel_reason.c_str());
+      } else {
+        RCLCPP_ERROR(
+          get_logger(), "Failed to spawn component '%s' (id %lu): %s", plugin.c_str(),
+          static_cast<uint64_t>(node_id), ex.what());
+      }
+
+      if (control_) {
+        control_->send_load_failed(node_id, error, cancelled);
+      }
+
+      // Publish LOAD_FAILED event
+      auto event = play_launch_msgs::msg::ComponentEvent();
+      event.stamp = now();
+      event.event_type = play_launch_msgs::msg::ComponentEvent::LOAD_FAILED;
+      event.unique_id = node_id;
+      event.package_name = pkg;
+      event.plugin_name = plugin;
+      event.error_message = error;
+      event_pub_->publish(event);
+    }
+  });
+}
+
 // ── Non-blocking on_load_node ───────────────────────────────────────────
 //
 // Phase 1 (synchronous): validate plugin exists, pre-assign unique_id, respond.
@@ -916,19 +1195,7 @@ void CloneIsolatedComponentManager::on_load_node(
 {
   // ── Phase 1: synchronous validation + pre-assign unique_id ──
 
-  // Look up component resources (ament index, fast)
-  auto resources = get_component_resources(request->package_name);
-
-  // Verify plugin exists
-  bool found = false;
-  for (const auto & resource : resources) {
-    if (resource.first == request->plugin_name) {
-      found = true;
-      break;
-    }
-  }
-
-  if (!found) {
+  if (!plugin_available(request->package_name, request->plugin_name)) {
     response->success = false;
     response->error_message =
       "Failed to find class with the requested plugin name '" + request->plugin_name + "'";
@@ -936,19 +1203,7 @@ void CloneIsolatedComponentManager::on_load_node(
     return;
   }
 
-  uint64_t node_id;
-  {
-    std::lock_guard<std::mutex> lock(load_mutex_);
-    node_id = unique_id_++;
-    if (0 == node_id) {
-      throw std::overflow_error("exhausted the unique ids for components in this process");
-    }
-  }
-
-  {
-    std::lock_guard<std::mutex> lock(pending_mutex_);
-    pending_node_ids_.insert(node_id);
-  }
+  const uint64_t node_id = reserve_node_id(0, request->plugin_name);
 
   // Approximate full_node_name for the immediate response.
   std::string approx_name;
@@ -972,93 +1227,154 @@ void CloneIsolatedComponentManager::on_load_node(
     request->plugin_name.c_str(), static_cast<uint64_t>(node_id));
 
   // ── Phase 2: async spawn on worker thread ──
-
-  auto pkg = request->package_name;
-  auto plugin = request->plugin_name;
-
-  submit_work([this, request, node_id, pkg, plugin]() {
-    // Guard: if shutdown already started, skip spawn entirely.
-    if (!rclcpp::ok()) {
-      std::lock_guard<std::mutex> lock(pending_mutex_);
-      pending_node_ids_.erase(node_id);
-      return;
-    }
-
-    try {
-      await_spawn_capacity(plugin);
-      auto child = spawn_child_process(node_id, request);
-      std::string actual_name = child.node_name;
-      const int32_t child_pid = static_cast<int32_t>(child.pid);
-      const uint64_t child_start_time = proc_start_time(child.pid);
-
-      // Re-check after spawn — SIGTERM may have arrived
-      if (!rclcpp::ok()) {
-        RCLCPP_DEBUG(
-          get_logger(), "Shutdown during spawn of '%s' (id %lu), killing child", plugin.c_str(),
-          static_cast<uint64_t>(node_id));
-        cleanup_child(child);
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_node_ids_.erase(node_id);
-        return;
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(children_mutex_);
-        children_[node_id] = std::move(child);
-      }
-
-      {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_node_ids_.erase(node_id);
-      }
-
-      RCLCPP_INFO(
-        get_logger(), "Component '%s' loaded as '%s' (id %lu)", plugin.c_str(), actual_name.c_str(),
-        static_cast<uint64_t>(node_id));
-
-      // Publish LOADED event
-      if (rclcpp::ok()) {
-        auto event = play_launch_msgs::msg::ComponentEvent();
-        event.stamp = now();
-        event.event_type = play_launch_msgs::msg::ComponentEvent::LOADED;
-        event.unique_id = node_id;
-        event.full_node_name = actual_name;
-        event.package_name = pkg;
-        event.plugin_name = plugin;
-        event.pid = child_pid;
-        event.start_time = child_start_time;
-        event_pub_->publish(event);
-      }
-    } catch (const std::exception & ex) {
-      {
-        std::lock_guard<std::mutex> lock(pending_mutex_);
-        pending_node_ids_.erase(node_id);
-      }
-
-      if (!rclcpp::ok()) {
-        RCLCPP_DEBUG(
-          get_logger(), "Spawn interrupted by shutdown for '%s' (id %lu)", plugin.c_str(),
-          static_cast<uint64_t>(node_id));
-        return;
-      }
-
-      RCLCPP_ERROR(
-        get_logger(), "Failed to spawn component '%s' (id %lu): %s", plugin.c_str(),
-        static_cast<uint64_t>(node_id), ex.what());
-
-      // Publish LOAD_FAILED event
-      auto event = play_launch_msgs::msg::ComponentEvent();
-      event.stamp = now();
-      event.event_type = play_launch_msgs::msg::ComponentEvent::LOAD_FAILED;
-      event.unique_id = node_id;
-      event.package_name = pkg;
-      event.plugin_name = plugin;
-      event.error_message = ex.what();
-      event_pub_->publish(event);
-    }
-  });
+  submit_spawn(node_id, request);
 }
 
+// ── Phase 64: the same load, asked for over the private control channel ──
+//
+// Identical work, different answer path: `Accepted` carries the pre-assigned
+// id the LoadNode response used to carry, and it is written to a socket
+// nobody else is contending for. Runs on the channel's reader thread, which
+// is safe here for the reason `accepts_socket_loads` gives — phase 1 touches
+// only this class's own mutexes, and phase 2 is the worker pool it always was.
+
+void CloneIsolatedComponentManager::handle_control_load(
+  uint64_t seq, std::shared_ptr<LoadNode::Request> request)
+{
+  if (!plugin_available(request->package_name, request->plugin_name)) {
+    const std::string error =
+      "Failed to find class with the requested plugin name '" + request->plugin_name + "'";
+    RCLCPP_ERROR(get_logger(), "%s", error.c_str());
+    if (control_) {
+      control_->send_rejected(seq, error);
+    }
+    return;
+  }
+
+  uint64_t node_id = 0;
+  try {
+    node_id = reserve_node_id(seq, request->plugin_name);
+  } catch (const std::exception & ex) {
+    if (control_) {
+      control_->send_rejected(seq, ex.what());
+    }
+    return;
+  }
+
+  if (control_) {
+    control_->send_accepted(seq, node_id);
+  }
+
+  RCLCPP_INFO(
+    get_logger(), "Accepted control-channel load for '%s' (pre-assigned id %lu), spawning async...",
+    request->plugin_name.c_str(), static_cast<uint64_t>(node_id));
+
+  submit_spawn(node_id, request);
+}
+
+// ── Phase 64 W2: answering, instead of being guessed at ─────────────────
+//
+// The supervisor cannot tell a slow constructor from a lost load, and every
+// mechanism that tried to infer it from a clock got one of the two wrong. This
+// manager knows: it holds the pending map, the child pids and the children
+// map. `unknown` here is a positive statement — "nothing is running for this
+// id and nothing is queued for it" — and it is the ONLY answer that lets the
+// supervisor resend.
+
+void CloneIsolatedComponentManager::handle_control_query(
+  std::optional<uint64_t> seq, std::optional<uint64_t> unique_id)
+{
+  if (!control_) {
+    return;
+  }
+
+  uint64_t id = unique_id.value_or(0);
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    // Asked by seq (the load was never acknowledged, as far as the supervisor
+    // knows): resolve it ourselves rather than reporting `unknown` for a load
+    // we did accept.
+    if (!unique_id.has_value() && seq.has_value()) {
+      auto mapped = seq_to_id_.find(*seq);
+      if (mapped != seq_to_id_.end()) {
+        id = mapped->second;
+      }
+    }
+
+    auto pending = pending_loads_.find(id);
+    if (id != 0 && pending != pending_loads_.end()) {
+      const auto & load = pending->second;
+      const uint64_t elapsed_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - load.started)
+          .count());
+      const uint64_t cpu_ms = load.pid > 0 ? proc_cpu_ms(load.pid) : 0;
+      control_->send_status(
+        seq, id, load.phase, static_cast<int>(load.pid), elapsed_ms, cpu_ms, load.plugin,
+        load.pid > 0, "");
+      return;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(children_mutex_);
+    auto child = children_.find(id);
+    if (id != 0 && child != children_.end()) {
+      control_->send_status(
+        seq, id, LoadPhase::Loaded, static_cast<int>(child->second.pid), 0,
+        proc_cpu_ms(child->second.pid), "", true, child->second.node_name);
+      return;
+    }
+  }
+
+  control_->send_status(seq, id, LoadPhase::Unknown, 0, 0, 0, "", false, "");
+}
+
+void CloneIsolatedComponentManager::handle_control_cancel(
+  uint64_t unique_id, const std::string & reason)
+{
+  // Three cases, and each must answer: the supervisor treats a confirmed
+  // cancellation as "nothing is running for this id", which is what it waits
+  // for before resending. A cancel that is silently dropped is a load that
+  // never resolves.
+  pid_t victim = 0;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    auto pending = pending_loads_.find(unique_id);
+    if (pending != pending_loads_.end()) {
+      pending->second.cancelled = true;
+      pending->second.cancel_reason = reason;
+      victim = pending->second.pid;
+    }
+  }
+
+  if (victim > 0) {
+    // Kill the child; the spawn path's liveness check ends the ready-wait,
+    // the exception handler unwinds it, and the `load_failed { cancelled }`
+    // is sent from there — one reporting path, whether the kill lands before
+    // or after the constructor would have finished.
+    RCLCPP_WARN(
+      get_logger(), "Cancelling load %lu: killing pid %d (%s)",
+      static_cast<uint64_t>(unique_id), static_cast<int>(victim), reason.c_str());
+    kill(victim, SIGKILL);
+    return;
+  }
+  if (victim == 0) {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    if (pending_loads_.count(unique_id) > 0) {
+      // Queued, not yet forked: the worker will see the flag and report.
+      RCLCPP_INFO(
+        get_logger(), "Load %lu cancelled while queued (%s)", static_cast<uint64_t>(unique_id),
+        reason.c_str());
+      return;
+    }
+  }
+
+  // Already finished, or never existed. Answer with what IS true rather than
+  // with a cancellation that did not happen: an already-loaded component is
+  // unloaded, not cancelled, and the supervisor reconciles from the status.
+  handle_control_query(std::nullopt, unique_id);
+}
 // ── on_unload_node override ─────────────────────────────────────────────
 
 void CloneIsolatedComponentManager::on_unload_node(
@@ -1069,7 +1385,7 @@ void CloneIsolatedComponentManager::on_unload_node(
   // Reject unload if node is still being constructed
   {
     std::lock_guard<std::mutex> lock(pending_mutex_);
-    if (pending_node_ids_.count(request->unique_id) > 0) {
+    if (pending_loads_.count(request->unique_id) > 0) {
       response->success = false;
       response->error_message =
         "Node with unique_id " + std::to_string(request->unique_id) + " is still being constructed";
@@ -1105,6 +1421,10 @@ void CloneIsolatedComponentManager::on_unload_node(
     get_logger(), "Unloaded node '%s' (id %lu)", full_name.c_str(),
     static_cast<uint64_t>(request->unique_id));
 
+  if (control_) {
+    control_->send_unloaded(request->unique_id, full_name);
+  }
+
   // Publish UNLOADED event
   if (rclcpp::ok()) {
     auto event = play_launch_msgs::msg::ComponentEvent();
@@ -1128,7 +1448,7 @@ void CloneIsolatedComponentManager::on_list_nodes(
 
   for (const auto & [id, child] : children_) {
     // Skip nodes still being constructed
-    if (pending_node_ids_.count(id) > 0) {
+    if (pending_loads_.count(id) > 0) {
       continue;
     }
     response->unique_ids.push_back(id);
@@ -1223,6 +1543,10 @@ void CloneIsolatedComponentManager::handle_child_death(uint64_t node_id)
   RCLCPP_ERROR(
     get_logger(), "Child PID %d crashed for node '%s': %s", child.pid, child.node_name.c_str(),
     error_msg.c_str());
+
+  if (control_) {
+    control_->send_crashed(node_id, child.node_name, error_msg, static_cast<int>(child.pid));
+  }
 
   // Publish CRASHED event
   try {

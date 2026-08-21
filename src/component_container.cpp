@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "play_launch_container/clone_isolated_component_manager.hpp"
+#include "play_launch_container/control_channel.hpp"
 #include "play_launch_container/observable_component_manager.hpp"
 #include "rclcpp/rclcpp.hpp"
 
@@ -29,19 +30,31 @@ int main(int argc, char * argv[])
   ///   component_container --use_multi_threaded_executor # multi-threaded
   ///   component_container --isolated                   # fork+exec per-node
   ///   component_container --isolated --use_multi_threaded_executor
-  rclcpp::init(argc, argv);
-
-  // Parse CLI args (same pattern as upstream component_container_isolated.cpp)
+  // Phase 64: scan argv and answer play_launch BEFORE rclcpp::init.
+  //
+  // The hello is what tells the supervisor which transport its loads take, and
+  // it holds its first load until the answer arrives. `rclcpp::init` performs
+  // DDS setup, which under a 150-process startup is exactly the delay this
+  // channel exists to route around, so the answer must not wait for it.
   bool use_multi_threaded = false;
   bool use_isolated = false;
-  std::vector<std::string> args = rclcpp::remove_ros_arguments(argc, argv);
-  for (const auto & arg : args) {
+  for (int i = 1; i < argc; ++i) {
+    const std::string arg(argv[i]);
     if (arg == "--use_multi_threaded_executor") {
       use_multi_threaded = true;
     } else if (arg == "--isolated") {
       use_isolated = true;
     }
   }
+
+  auto control = play_launch_container::ControlChannel::from_env();
+  if (control) {
+    // Only the isolated manager takes loads over the socket; see
+    // ObservableComponentManager::accepts_socket_loads.
+    control->send_hello(use_isolated);
+  }
+
+  rclcpp::init(argc, argv);
 
   // Create executor
   std::shared_ptr<rclcpp::Executor> exec;
@@ -59,6 +72,11 @@ int main(int argc, char * argv[])
   } else {
     node = std::make_shared<play_launch_container::ObservableComponentManager>(exec);
   }
+
+  // Hand the manager the channel. Loads sent between the hello and this point
+  // were queued by the channel and are replayed here, so the supervisor never
+  // has to wait for the manager to exist before asking.
+  node->set_control_channel(control);
 
   // Handle thread_num parameter for MT mode
   if (use_multi_threaded && node->has_parameter("thread_num")) {

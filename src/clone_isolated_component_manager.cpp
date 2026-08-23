@@ -662,6 +662,8 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   }
 
   // Check extra_arguments for log_dir and executor_threads.
+  // (`forward_global_arguments` is diagnosed below; `use_intra_process_comms`
+  // is not read here at all — see the note further down.)
   //
   // `use_intra_process_comms` is deliberately NOT forwarded. Each composable
   // here gets its own process holding exactly one node, so the intra-process
@@ -672,6 +674,32 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   std::string log_dir;
   for (const auto & extra : request->extra_arguments) {
     if (
+      extra.name == "forward_global_arguments" &&
+      extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_BOOL &&
+      !extra.value.bool_value) {
+      // The second standard extra argument upstream honours
+      // (`ComponentManager::create_node_options`), and the one place where
+      // isolated mode cannot simply do the same thing.
+      //
+      // In a shared container it means "do not let the CONTAINER's own
+      // command-line arguments leak into this composable". Here there is no
+      // such thing to leak: `component_node`'s global arguments ARE this
+      // composable's — the `-r __node:=`, `-r __ns:=` and `--params-file` this
+      // manager synthesised for it. Honouring the request literally would
+      // strip the node of its own name, namespace and parameters, so it is
+      // refused rather than obeyed.
+      //
+      // Said out loud, because a setting that is quietly ignored is the defect
+      // this codebase keeps finding.
+      RCLCPP_WARN(
+        get_logger(),
+        "'%s': extra argument forward_global_arguments=false cannot be honoured in isolated "
+        "mode and is ignored. Each composable runs in its own process whose global arguments "
+        "are its OWN name, namespace and parameters — there are no container arguments to "
+        "withhold, and applying it would strip the node of its identity. Use "
+        "--container-mode observable if the node depends on it.",
+        request->node_name.c_str());
+    } else if (
       extra.name == "log_dir" &&
       extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_STRING) {
       log_dir = extra.value.string_value;

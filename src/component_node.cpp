@@ -61,6 +61,10 @@ int main(int argc, char * argv[])
   std::string plugin_name;
   int ready_fd = -1;
   bool use_multi_threaded = false;
+  // Upstream `ComponentManager::create_node_options` defaults to
+  // `use_global_arguments(false)` and only sets it true when a composable's
+  // `forward_global_arguments` extra argument says so. Same default here.
+  bool forward_global_arguments = false;
   // 0 = size the pool from the node's callback groups (see below).
   size_t executor_threads = 0;
 
@@ -79,6 +83,8 @@ int main(int argc, char * argv[])
       ready_fd = std::atoi(argv[++i]);
     } else if (arg == "--use-multi-threaded-executor") {
       use_multi_threaded = true;
+    } else if (arg == "--forward-global-arguments") {
+      forward_global_arguments = true;
     } else if (arg == "--executor-threads" && i + 1 < argc) {
       executor_threads = static_cast<size_t>(std::atoi(argv[++i]));
     }
@@ -177,6 +183,26 @@ int main(int argc, char * argv[])
 
     // rclcpp::init() already parsed --ros-args (remappings, params-file)
     // so NodeOptions() picks them up via default context
+    // Mirror upstream `ComponentManager::create_node_options`.
+    //
+    // Upstream hands a composable its identity through
+    // `NodeOptions::arguments()` and sets `use_global_arguments(false)`, so the
+    // node reads its own `__node`/`__ns`/params and NOT whatever the container
+    // process was started with. This binary used to rely on the opposite —
+    // `use_global_arguments(true)`, with the identity arriving through the
+    // process's global arguments — which works only because those globals are
+    // the composable's own, and which left `forward_global_arguments`
+    // meaningless.
+    //
+    // Passing the same `--ros-args` explicitly makes the node's identity
+    // independent of the global-argument setting, so that setting becomes a
+    // real choice rather than a load-bearing constant.
+    std::vector<std::string> node_arguments;
+    node_arguments.reserve(static_cast<size_t>(argc - ros_args_start) + 1);
+    for (int i = ros_args_start; i < argc; ++i) {
+      node_arguments.emplace_back(argv[i]);
+    }
+
     // Intra-process comms is deliberately NOT enabled here, and there is no
     // flag to enable it. This process hosts exactly one node — a single
     // `--plugin`, one `create_node_instance`, one `add_node` — so there can
@@ -184,13 +210,15 @@ int main(int argc, char * argv[])
     // would build the IntraProcessManager machinery and check it on every
     // publish, always finding nothing.
     //
-    // The setting still WORKS where it can: in `stock` and `observable` modes
-    // the composables are threads sharing one container process, and upstream
-    // `rclcpp_components::ComponentManager::create_node_options` reads
+    // It still WORKS where it can: in `stock` and `observable` the composables
+    // are threads sharing one container process, and upstream reads
     // `use_intra_process_comms` out of the LoadNode request itself. Nothing in
     // this binary is involved in that path.
     rclcpp::NodeOptions options;
-    options.use_global_arguments(true);
+    if (!node_arguments.empty()) {
+      options.arguments(node_arguments);
+    }
+    options.use_global_arguments(forward_global_arguments);
     auto wrapper = factory->create_node_instance(options);
     auto node_base = wrapper.get_node_base_interface();
     std::string full_name = node_base->get_fully_qualified_name();

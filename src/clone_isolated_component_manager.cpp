@@ -661,9 +661,9 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
     args.push_back("--use-multi-threaded-executor");
   }
 
-  // Check extra_arguments for log_dir and executor_threads.
-  // (`forward_global_arguments` is diagnosed below; `use_intra_process_comms`
-  // is not read here at all — see the note further down.)
+  // Check extra_arguments for forward_global_arguments, log_dir and
+  // executor_threads. (`use_intra_process_comms` is deliberately not read —
+  // see the note further down.)
   //
   // `use_intra_process_comms` is deliberately NOT forwarded. Each composable
   // here gets its own process holding exactly one node, so the intra-process
@@ -675,30 +675,28 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
   for (const auto & extra : request->extra_arguments) {
     if (
       extra.name == "forward_global_arguments" &&
-      extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_BOOL &&
-      !extra.value.bool_value) {
+      extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_BOOL) {
       // The second standard extra argument upstream honours
-      // (`ComponentManager::create_node_options`), and the one place where
-      // isolated mode cannot simply do the same thing.
+      // (`ComponentManager::create_node_options`). `false` is upstream's
+      // default and needs no flag; `true` asks the node to also apply its
+      // process's global arguments.
       //
-      // In a shared container it means "do not let the CONTAINER's own
-      // command-line arguments leak into this composable". Here there is no
-      // such thing to leak: `component_node`'s global arguments ARE this
-      // composable's — the `-r __node:=`, `-r __ns:=` and `--params-file` this
-      // manager synthesised for it. Honouring the request literally would
-      // strip the node of its own name, namespace and parameters, so it is
-      // refused rather than obeyed.
-      //
-      // Said out loud, because a setting that is quietly ignored is the defect
-      // this codebase keeps finding.
-      RCLCPP_WARN(
-        get_logger(),
-        "'%s': extra argument forward_global_arguments=false cannot be honoured in isolated "
-        "mode and is ignored. Each composable runs in its own process whose global arguments "
-        "are its OWN name, namespace and parameters — there are no container arguments to "
-        "withhold, and applying it would strip the node of its identity. Use "
-        "--container-mode observable if the node depends on it.",
-        request->node_name.c_str());
+      // Upstream warns when it is true, because in a shared container that
+      // means the CONTAINER's command line starts influencing one composable.
+      // The same warning is warranted here for a different reason: this
+      // composable's process was given only its own `--ros-args`, so `true`
+      // buys nothing today and would quietly start meaning something if that
+      // ever changed.
+      if (extra.value.bool_value) {
+        args.push_back("--forward-global-arguments");
+        RCLCPP_WARN(
+          get_logger(),
+          "'%s': forward_global_arguments is true, which is not recommended — a node's "
+          "behaviour then depends on arguments not targeted at it. In isolated mode this "
+          "process receives only this composable's own --ros-args, so it currently changes "
+          "nothing.",
+          request->node_name.c_str());
+      }
     } else if (
       extra.name == "log_dir" &&
       extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_STRING) {

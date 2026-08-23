@@ -1,0 +1,6 @@
+[0.000000] (-) TimerEvent: {}
+[0.000170] (play_launch_container) JobQueued: {'identifier': 'play_launch_container', 'dependencies': OrderedDict([('play_launch_msgs', '/home/aeon/repos/play_launch/src/play_launch_container/install/play_launch_msgs'), ('play_launch_container', '/home/aeon/repos/play_launch/src/play_launch_container/install/play_launch_container')])}
+[0.000661] (play_launch_container) JobStarted: {'identifier': 'play_launch_container'}
+[0.003016] (play_launch_container) StderrLine: {'line': b'Traceback (most recent call last):\n  File "/usr/lib/python3/dist-packages/colcon_core/executor/__init__.py", line 91, in __call__\n    rc = await self.task(*args, **kwargs)\n  File "/usr/lib/python3/dist-packages/colcon_core/task/__init__.py", line 93, in __call__\n    return await task_method(*args, **kwargs)\n  File "/usr/lib/python3/dist-packages/colcon_ros/task/ament_cmake/test.py", line 29, in test\n    return await extension.test()\n  File "/usr/lib/python3/dist-packages/colcon_cmake/task/cmake/test.py", line 44, in test\n    assert os.path.exists(args.build_base), \\\nAssertionError: Has this package been built before?\n'}
+[0.003620] (play_launch_container) JobEnded: {'identifier': 'play_launch_container', 'rc': 1}
+[0.013459] (-) EventReactorShutdown: {}

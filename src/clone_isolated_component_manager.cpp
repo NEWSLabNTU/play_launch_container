@@ -661,16 +661,17 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
     args.push_back("--use-multi-threaded-executor");
   }
 
-  // Check extra_arguments for use_intra_process_comms, log_dir and
-  // executor_threads
+  // Check extra_arguments for log_dir and executor_threads.
+  //
+  // `use_intra_process_comms` is deliberately NOT forwarded. Each composable
+  // here gets its own process holding exactly one node, so the intra-process
+  // path can never find a peer — see the note in `component_node.cpp`. The
+  // setting is still honoured in `stock` and `observable` modes, where
+  // composables share a process and upstream `ComponentManager` reads it
+  // straight from the LoadNode request without our involvement.
   std::string log_dir;
   for (const auto & extra : request->extra_arguments) {
     if (
-      extra.name == "use_intra_process_comms" &&
-      extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_BOOL &&
-      extra.value.bool_value) {
-      args.push_back("--use-intra-process-comms");
-    } else if (
       extra.name == "log_dir" &&
       extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_STRING) {
       log_dir = extra.value.string_value;

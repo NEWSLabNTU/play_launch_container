@@ -61,7 +61,6 @@ int main(int argc, char * argv[])
   std::string plugin_name;
   int ready_fd = -1;
   bool use_multi_threaded = false;
-  bool use_intra_process_comms = false;
   // 0 = size the pool from the node's callback groups (see below).
   size_t executor_threads = 0;
 
@@ -80,8 +79,6 @@ int main(int argc, char * argv[])
       ready_fd = std::atoi(argv[++i]);
     } else if (arg == "--use-multi-threaded-executor") {
       use_multi_threaded = true;
-    } else if (arg == "--use-intra-process-comms") {
-      use_intra_process_comms = true;
     } else if (arg == "--executor-threads" && i + 1 < argc) {
       executor_threads = static_cast<size_t>(std::atoi(argv[++i]));
     }
@@ -180,9 +177,20 @@ int main(int argc, char * argv[])
 
     // rclcpp::init() already parsed --ros-args (remappings, params-file)
     // so NodeOptions() picks them up via default context
+    // Intra-process comms is deliberately NOT enabled here, and there is no
+    // flag to enable it. This process hosts exactly one node — a single
+    // `--plugin`, one `create_node_instance`, one `add_node` — so there can
+    // never be a local subscriber for the intra-process path to match. rclcpp
+    // would build the IntraProcessManager machinery and check it on every
+    // publish, always finding nothing.
+    //
+    // The setting still WORKS where it can: in `stock` and `observable` modes
+    // the composables are threads sharing one container process, and upstream
+    // `rclcpp_components::ComponentManager::create_node_options` reads
+    // `use_intra_process_comms` out of the LoadNode request itself. Nothing in
+    // this binary is involved in that path.
     rclcpp::NodeOptions options;
     options.use_global_arguments(true);
-    options.use_intra_process_comms(use_intra_process_comms);
     auto wrapper = factory->create_node_instance(options);
     auto node_base = wrapper.get_node_base_interface();
     std::string full_name = node_base->get_fully_qualified_name();

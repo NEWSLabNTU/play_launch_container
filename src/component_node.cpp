@@ -27,6 +27,7 @@
 
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -61,6 +62,8 @@ int main(int argc, char * argv[])
   int ready_fd = -1;
   bool use_multi_threaded = false;
   bool use_intra_process_comms = false;
+  // 0 = size the pool from the node's callback groups (see below).
+  size_t executor_threads = 0;
 
   int ros_args_start = argc;  // index of --ros-args in argv
   for (int i = 1; i < argc; ++i) {
@@ -79,6 +82,8 @@ int main(int argc, char * argv[])
       use_multi_threaded = true;
     } else if (arg == "--use-intra-process-comms") {
       use_intra_process_comms = true;
+    } else if (arg == "--executor-threads" && i + 1 < argc) {
+      executor_threads = static_cast<size_t>(std::atoi(argv[++i]));
     }
   }
 
@@ -187,10 +192,58 @@ int main(int argc, char * argv[])
       write_ready(ready_fd, "OK " + full_name);
     }
 
-    // Spin until SIGTERM
+    // Spin until SIGTERM.
+    //
+    // `--use-multi-threaded-executor` comes from the CONTAINER, which got it
+    // because the launch file asked for `component_container_mt`. There it
+    // means "the executor shared by this container's N composables should be
+    // multi-threaded". Here there is no sharing: a fork+exec'd child hosts
+    // exactly ONE node, and `MultiThreadedExecutor`'s default pool is
+    // `std::thread::hardware_concurrency()` — so each child inherited a pool
+    // sized for a crowd it does not have. Measured on a 12-core board: 22
+    // threads per child against 11, for six talker/listener composables.
+    //
+    // Dropping the multi-threaded executor instead would be wrong. A single
+    // node can legitimately need one: a Reentrant callback group, or a node
+    // that calls a service from inside a callback, DEADLOCKS on a
+    // SingleThreadedExecutor. The policy is right; only the size was wrong.
+    //
+    // The bound is exact rather than a heuristic. A MutuallyExclusive group
+    // admits one callback at a time, so a pool larger than the number of such
+    // groups has threads that can never be handed work. A Reentrant group is
+    // explicitly unbounded — that node asked for parallelism — so it keeps the
+    // default rather than being second-guessed.
+    //
+    // Exact for the groups that exist HERE, which is the one limitation: a
+    // MultiThreadedExecutor fixes its pool at construction, so a node that
+    // creates a callback group later, at runtime, is left with the pool its
+    // constructor implied. `--executor-threads` overrides the derivation for
+    // that case. It is reachable only when running this binary directly: a
+    // launch file cannot set it, because the XML parser accepts
+    // `<extra_arg>` as a child of `<composable_node>` and then discards it.
+    //
+    // NOTE: this reduces threads, and it is NOT a throughput fix. Halving the
+    // thread count was measured against peak runnable tasks over three runs
+    // per arm and moved it not at all; idle executor threads block in
+    // `rcl_wait` rather than sitting on the runqueue.
     std::shared_ptr<rclcpp::Executor> exec;
     if (use_multi_threaded) {
-      exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>();
+      size_t threads = executor_threads;
+      if (threads == 0) {
+        size_t mutually_exclusive = 0;
+        bool reentrant = false;
+        node_base->for_each_callback_group([&](rclcpp::CallbackGroup::SharedPtr group) {
+          if (group->type() == rclcpp::CallbackGroupType::Reentrant) {
+            reentrant = true;
+          } else {
+            ++mutually_exclusive;
+          }
+        });
+        // 0 keeps rclcpp's own default (hardware_concurrency).
+        threads = reentrant ? 0 : std::max<size_t>(mutually_exclusive, 1);
+      }
+      exec = std::make_shared<rclcpp::executors::MultiThreadedExecutor>(
+        rclcpp::ExecutorOptions(), threads);
     } else {
       exec = std::make_shared<rclcpp::executors::SingleThreadedExecutor>();
     }

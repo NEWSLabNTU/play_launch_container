@@ -674,6 +674,14 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
       extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_STRING) {
       log_dir = extra.value.string_value;
     }
+    // NOT forwarded: `executor_threads`. `component_node` accepts
+    // `--executor-threads`, but a launch file cannot reach it — the XML parser
+    // lists `extra_arg` as an allowed child of `<composable_node>` and then
+    // never reads one (`actions/container.rs`: `let extra_args =
+    // HashMap::new();`, never filled), so every `<extra_arg>` is accepted and
+    // discarded before it could arrive here. Forwarding it would be a branch
+    // that can never execute, and an option that silently does nothing is
+    // worse than an option that does not exist.
   }
 
   // Serialize parameters to temp YAML

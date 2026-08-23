@@ -661,7 +661,8 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
     args.push_back("--use-multi-threaded-executor");
   }
 
-  // Check extra_arguments for use_intra_process_comms and log_dir
+  // Check extra_arguments for use_intra_process_comms, log_dir and
+  // executor_threads
   std::string log_dir;
   for (const auto & extra : request->extra_arguments) {
     if (
@@ -673,15 +674,26 @@ CloneIsolatedComponentManager::ChildInfo CloneIsolatedComponentManager::spawn_ch
       extra.name == "log_dir" &&
       extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_STRING) {
       log_dir = extra.value.string_value;
+    } else if (
+      extra.name == "executor_threads" &&
+      extra.value.type == rcl_interfaces::msg::ParameterType::PARAMETER_INTEGER &&
+      extra.value.integer_value > 0) {
+      // Overrides the pool `component_node` otherwise derives from the node's
+      // callback groups. That derivation is exact for the groups existing when
+      // the executor is built, and a MultiThreadedExecutor fixes its pool at
+      // construction — so a node creating a callback group LATER, at runtime,
+      // would be left short. This is how it says so, from the launch file:
+      //
+      //   <composable_node ...>
+      //     <extra_arg name="executor_threads" value="4"/>
+      //   </composable_node>
+      //
+      // Only reachable since issue #0022: `<extra_arg>` was an allowed child
+      // that the XML parser never read, so this branch was written, found
+      // unreachable, and removed until the parser carried the value.
+      args.push_back("--executor-threads");
+      args.push_back(std::to_string(extra.value.integer_value));
     }
-    // NOT forwarded: `executor_threads`. `component_node` accepts
-    // `--executor-threads`, but a launch file cannot reach it — the XML parser
-    // lists `extra_arg` as an allowed child of `<composable_node>` and then
-    // never reads one (`actions/container.rs`: `let extra_args =
-    // HashMap::new();`, never filled), so every `<extra_arg>` is accepted and
-    // discarded before it could arrive here. Forwarding it would be a branch
-    // that can never execute, and an option that silently does nothing is
-    // worse than an option that does not exist.
   }
 
   // Serialize parameters to temp YAML

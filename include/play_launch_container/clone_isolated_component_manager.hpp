@@ -69,8 +69,7 @@ public:
   bool accepts_socket_loads() const override { return true; }
 
 protected:
-  void handle_control_load(
-    uint64_t seq, std::shared_ptr<LoadNode::Request> request) override;
+  void handle_control_load(uint64_t seq, std::shared_ptr<LoadNode::Request> request) override;
 
   void handle_control_query(
     std::optional<uint64_t> seq, std::optional<uint64_t> unique_id) override;

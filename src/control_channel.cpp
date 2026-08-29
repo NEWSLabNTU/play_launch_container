@@ -20,6 +20,7 @@
 
 #include <atomic>
 #include <cerrno>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -191,17 +192,18 @@ std::shared_ptr<ControlChannel> ControlChannel::from_env()
   }
   errno = 0;
   char * end = nullptr;
-  const long fd = std::strtol(env, &end, 10);
+  const long fd = std::strtol(env, &end, 10);  // NOLINT(runtime/int) — strtol's own return type
   if (errno != 0 || end == env || *end != '\0' || fd < 0 || fd > 1024 * 1024) {
-    std::fprintf(stderr, "[play_launch_container] ignoring %s='%s' (want an fd number)\n", kFdEnv,
-                 env);
+    std::fprintf(
+      stderr, "[play_launch_container] ignoring %s='%s' (want an fd number)\n", kFdEnv, env);
     return nullptr;
   }
   // A stale value would otherwise get us writing frames into whatever else
   // happens to hold that descriptor.
   if (::fcntl(static_cast<int>(fd), F_GETFD) < 0) {
-    std::fprintf(stderr, "[play_launch_container] %s=%ld is not an open descriptor: %s\n", kFdEnv,
-                 fd, std::strerror(errno));
+    std::fprintf(
+      stderr, "[play_launch_container] %s=%ld is not an open descriptor: %s\n", kFdEnv, fd,
+      std::strerror(errno));
     return nullptr;
   }
   return std::shared_ptr<ControlChannel>(new ControlChannel(static_cast<int>(fd)));
@@ -334,8 +336,7 @@ void ControlChannel::send_loaded(
   send_raw(w.str());
 }
 
-void ControlChannel::send_load_failed(
-  uint64_t unique_id, const std::string & error, bool cancelled)
+void ControlChannel::send_load_failed(uint64_t unique_id, const std::string & error, bool cancelled)
 {
   json::ObjectWriter w;
   w.field("t", "load_failed")
@@ -362,8 +363,7 @@ void ControlChannel::send_constructing(
 
 void ControlChannel::send_status(
   std::optional<uint64_t> seq, uint64_t unique_id, LoadPhase phase, int pid, uint64_t elapsed_ms,
-  uint64_t cpu_ms, const std::string & plugin, bool cancellable,
-  const std::string & full_node_name)
+  uint64_t cpu_ms, const std::string & plugin, bool cancellable, const std::string & full_node_name)
 {
   json::ObjectWriter w;
   w.field("t", "status");
@@ -422,8 +422,8 @@ void ControlChannel::send_raw(const std::string & payload)
     // container keeps running and its ROS interfaces are untouched, which is
     // exactly the fallback the LoadNode service exists to be.
     if (active_.exchange(false)) {
-      std::fprintf(stderr, "[play_launch_container] control channel write failed: %s\n",
-                   std::strerror(errno));
+      std::fprintf(
+        stderr, "[play_launch_container] control channel write failed: %s\n", std::strerror(errno));
     }
   }
 }
@@ -438,13 +438,12 @@ void ControlChannel::reader_loop()
     if (!read_exact(fd, header, sizeof(header))) {
       break;
     }
-    const uint32_t len = static_cast<uint32_t>(header[0]) |
-                         (static_cast<uint32_t>(header[1]) << 8) |
-                         (static_cast<uint32_t>(header[2]) << 16) |
-                         (static_cast<uint32_t>(header[3]) << 24);
+    const uint32_t len =
+      static_cast<uint32_t>(header[0]) | (static_cast<uint32_t>(header[1]) << 8) |
+      (static_cast<uint32_t>(header[2]) << 16) | (static_cast<uint32_t>(header[3]) << 24);
     if (len > kMaxFrameBytes) {
-      std::fprintf(stderr, "[play_launch_container] control frame of %u bytes exceeds the cap\n",
-                   len);
+      std::fprintf(
+        stderr, "[play_launch_container] control frame of %u bytes exceeds the cap\n", len);
       break;
     }
     std::string payload(len, '\0');
@@ -469,10 +468,11 @@ void ControlChannel::dispatch(const std::string & payload)
   if (type == "hello") {
     const uint32_t peer = static_cast<uint32_t>(msg["protocol"].as_uint64());
     if (peer != kProtocolVersion) {
-      std::fprintf(stderr,
-                   "[play_launch_container] control protocol v%u from play_launch != v%u here; "
-                   "falling back to the LoadNode service\n",
-                   peer, kProtocolVersion);
+      std::fprintf(
+        stderr,
+        "[play_launch_container] control protocol v%u from play_launch != v%u here; "
+        "falling back to the LoadNode service\n",
+        peer, kProtocolVersion);
       active_ = false;
     }
     return;
@@ -550,8 +550,8 @@ void ControlChannel::dispatch(const std::string & payload)
   static std::atomic<bool> dropped_first_load{false};
   if (fault_enabled("first_load") && !dropped_first_load.exchange(true)) {
     std::fprintf(
-      stderr, "[play_launch_container] FAULT INJECTION: dropping load seq %lu\n",
-      static_cast<unsigned long>(frame.seq));
+      stderr, "[play_launch_container] FAULT INJECTION: dropping load seq %" PRIu64 "\n",
+      frame.seq);
     return;
   }
 

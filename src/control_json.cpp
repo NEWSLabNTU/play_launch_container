@@ -88,7 +88,8 @@ int64_t Value::as_int64(int64_t fallback) const
   }
   errno = 0;
   char * end = nullptr;
-  const long long v = std::strtoll(number_.c_str(), &end, 10);
+  // NOLINT below: `long long` is strtoll's own return type, not a choice.
+  const long long v = std::strtoll(number_.c_str(), &end, 10);  // NOLINT(runtime/int)
   if (end == number_.c_str() || errno == ERANGE) {
     // A JSON number that is not an integer literal (1.5, 1e3) still has a
     // meaningful integer reading; fall through to the double path rather than
@@ -106,7 +107,9 @@ uint64_t Value::as_uint64(uint64_t fallback) const
   }
   errno = 0;
   char * end = nullptr;
-  const unsigned long long v = std::strtoull(number_.c_str(), &end, 10);
+  // NOLINT below: `unsigned long long` is strtoull's own return type.
+  const unsigned long long v =  // NOLINT(runtime/int)
+    std::strtoull(number_.c_str(), &end, 10);
   if (end == number_.c_str() || errno == ERANGE) {
     return fallback;
   }
@@ -381,8 +384,9 @@ private:
           }
           // A surrogate pair arrives as two escapes; join them so the UTF-8
           // that comes out is the character that went in.
-          if (cp >= 0xD800 && cp <= 0xDBFF && i_ + 1 < s_.size() && s_[i_] == '\\' &&
-              s_[i_ + 1] == 'u') {
+          if (
+            cp >= 0xD800 && cp <= 0xDBFF && i_ + 1 < s_.size() && s_[i_] == '\\' &&
+            s_[i_ + 1] == 'u') {
             const size_t save = i_;
             i_ += 2;
             uint32_t low = 0;
@@ -411,9 +415,8 @@ private:
       ++i_;
     }
     bool any = false;
-    while (i_ < s_.size() &&
-           ((s_[i_] >= '0' && s_[i_] <= '9') || s_[i_] == '.' || s_[i_] == 'e' || s_[i_] == 'E' ||
-            s_[i_] == '-' || s_[i_] == '+')) {
+    while (i_ < s_.size() && ((s_[i_] >= '0' && s_[i_] <= '9') || s_[i_] == '.' || s_[i_] == 'e' ||
+                              s_[i_] == 'E' || s_[i_] == '-' || s_[i_] == '+')) {
       any = true;
       ++i_;
     }

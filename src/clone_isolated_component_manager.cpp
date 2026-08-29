@@ -275,7 +275,7 @@ static uint64_t proc_cpu_ms(pid_t pid)
   if (!(rest >> utime >> stime)) {
     return 0;
   }
-  const long ticks = sysconf(_SC_CLK_TCK);
+  const long ticks = sysconf(_SC_CLK_TCK);  // NOLINT(runtime/int) — sysconf's own return type
   if (ticks <= 0) {
     return 0;
   }
@@ -1351,10 +1351,10 @@ void CloneIsolatedComponentManager::handle_control_query(
     auto pending = pending_loads_.find(id);
     if (id != 0 && pending != pending_loads_.end()) {
       const auto & load = pending->second;
-      const uint64_t elapsed_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now() - load.started)
-          .count());
+      const uint64_t elapsed_ms =
+        static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::steady_clock::now() - load.started)
+                                .count());
       const uint64_t cpu_ms = load.pid > 0 ? proc_cpu_ms(load.pid) : 0;
       control_->send_status(
         seq, id, load.phase, static_cast<int>(load.pid), elapsed_ms, cpu_ms, load.plugin,
@@ -1401,8 +1401,8 @@ void CloneIsolatedComponentManager::handle_control_cancel(
     // is sent from there — one reporting path, whether the kill lands before
     // or after the constructor would have finished.
     RCLCPP_WARN(
-      get_logger(), "Cancelling load %lu: killing pid %d (%s)",
-      static_cast<uint64_t>(unique_id), static_cast<int>(victim), reason.c_str());
+      get_logger(), "Cancelling load %lu: killing pid %d (%s)", static_cast<uint64_t>(unique_id),
+      static_cast<int>(victim), reason.c_str());
     kill(victim, SIGKILL);
     return;
   }

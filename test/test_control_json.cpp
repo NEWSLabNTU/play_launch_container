@@ -19,8 +19,8 @@
 #include "play_launch_container/control_json.hpp"
 
 using play_launch_container::json::ObjectWriter;
-using play_launch_container::json::Value;
 using play_launch_container::json::parse;
+using play_launch_container::json::Value;
 
 namespace
 {
@@ -89,8 +89,9 @@ TEST(ControlJson, ParsesEscapesAndUnicode)
 
 TEST(ControlJson, RejectsMalformedInput)
 {
-  for (const char * bad : {"", "{", R"({"a":})", R"({"a" 1})", R"({"a":1} trailing)", "[1,2",
-                           R"({"a":"unterminated})"}) {
+  for (const char * bad :
+       {"", "{", R"({"a":})", R"({"a" 1})", R"({"a":1} trailing)", "[1,2",
+        R"({"a":"unterminated})"}) {
     Value v;
     std::string error;
     EXPECT_FALSE(parse(bad, &v, &error)) << "accepted: " << bad;
@@ -112,9 +113,8 @@ TEST(ControlJson, WritesEscapedObjects)
 
   const std::string out = w.str();
   EXPECT_EQ(
-    out,
-    R"({"t":"load_failed","unique_id":12,"error":"he said \"no\"\nand\tleft\\","pid":4321,)"
-    R"("ok":false})");
+    out, R"({"t":"load_failed","unique_id":12,"error":"he said \"no\"\nand\tleft\\","pid":4321,)"
+         R"("ok":false})");
 
   // Round trip: what we wrote parses back to what we meant.
   const Value back = parse_ok(out);
@@ -123,10 +123,7 @@ TEST(ControlJson, WritesEscapedObjects)
   EXPECT_FALSE(back["ok"].as_bool(true));
 }
 
-TEST(ControlJson, EmptyObjectWritesAsEmpty)
-{
-  EXPECT_EQ(ObjectWriter().str(), "{}");
-}
+TEST(ControlJson, EmptyObjectWritesAsEmpty) { EXPECT_EQ(ObjectWriter().str(), "{}"); }
 
 /// Control characters must be \u-escaped rather than emitted raw: a raw 0x01
 /// in a string is invalid JSON and would break the whole frame, not just the

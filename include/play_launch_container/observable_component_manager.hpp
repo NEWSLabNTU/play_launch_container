@@ -67,8 +67,7 @@ protected:
   /// Handle one `load` frame. The base implementation refuses, because the
   /// supervisor is told `loads_over_socket: false` and should not have sent
   /// one; answering keeps a mistake visible instead of silent.
-  virtual void handle_control_load(
-    uint64_t seq, std::shared_ptr<LoadNode::Request> request);
+  virtual void handle_control_load(uint64_t seq, std::shared_ptr<LoadNode::Request> request);
 
   /// Answer "what is the state of this load?".
   ///
@@ -77,8 +76,7 @@ protected:
   /// anything else is `unknown`. That is honest here — this manager never has
   /// a load in flight that it could not already report, because
   /// `on_load_node` returns only when the node is constructed.
-  virtual void handle_control_query(
-    std::optional<uint64_t> seq, std::optional<uint64_t> unique_id);
+  virtual void handle_control_query(std::optional<uint64_t> seq, std::optional<uint64_t> unique_id);
 
   /// Stop a load. Not supported here: a thread-loaded component cannot be
   /// killed without taking its container's siblings with it, so this reports

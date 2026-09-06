@@ -238,26 +238,34 @@ bool CloneVmComponentManager::rmw_is_supported(std::string * reason_out)
 
   // Cyclone reads a thread-local from a dlopen'd module on its take path. That
   // goes through a dynamic TLS descriptor, whose resolver walks the calling
-  // thread's DTV, and a `_dl_allocate_tls` block is not in a state it accepts:
-  // the child segfaults in `_dl_tlsdesc_dynamic` under `dds_take` on the first
-  // message. Refuse up front rather than crash on the first subscription.
+  // thread's DTV, and a `_dl_allocate_tls` block is not in a state it accepts.
+  // The child dies on the first message taken -- observed as a SIGSEGV in
+  // `_dl_tlsdesc_dynamic` under `dds_take`, and on a later run as a SIGABRT
+  // from "double free or corruption". That the symptom moves is itself the
+  // signature: a corrupted TLS block does not fail the same way twice.
+  // Refuse up front rather than crash on the first subscription.
   if (rmw.find("cyclonedds") != std::string::npos) {
     if (reason_out) {
       *reason_out =
-        "rmw_cyclonedds_cpp segfaults in a clone(CLONE_VM) child: _dl_tlsdesc_dynamic "
-        "under dds_take, on the first message taken. Use RMW_IMPLEMENTATION="
-        "rmw_fastrtps_cpp, or --container-mode isolated.";
+        "rmw_cyclonedds_cpp dies in a clone(CLONE_VM) child on the first message taken: "
+        "_dl_tlsdesc_dynamic under dds_take. Use rmw_fastrtps_cpp or rmw_zenoh_cpp, "
+        "or --container-mode isolated.";
     }
     return false;
   }
 
-  // Everything else is unmeasured rather than known-good. Say so and continue:
+  // Measured working end to end, including a node loaded while another is
+  // spinning and a SIGSEGV that killed only the child that raised it.
+  const bool measured =
+    rmw.find("fastrtps") != std::string::npos || rmw.find("zenoh") != std::string::npos;
+
+  // Anything else is unmeasured rather than known-bad. Say so and continue:
   // this mode exists to be evaluated, and refusing an untested backend would
   // prevent the evaluation it is for.
-  if (rmw.find("fastrtps") == std::string::npos && reason_out) {
+  if (!measured && reason_out) {
     *reason_out = "rmw '" + rmw +
-                  "' has not been tested under clone(CLONE_VM); only rmw_fastrtps_cpp has. "
-                  "Proceeding anyway.";
+                  "' has not been tested under clone(CLONE_VM); rmw_fastrtps_cpp and "
+                  "rmw_zenoh_cpp have. Proceeding anyway.";
   }
   return true;
 }

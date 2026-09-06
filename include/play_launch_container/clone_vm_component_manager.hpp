@@ -52,12 +52,13 @@ namespace play_launch_container
 /// It is selected by `--container-mode clone-vm`, which clap does not print.
 /// Three things are measured and one large one is not:
 ///
-///  * `rmw_fastrtps_cpp` runs a node to completion in a clone child, including
-///    a second node loaded while the first is spinning, and shuts down clean.
-///  * `rmw_cyclonedds_cpp` **segfaults** inside `dds_take`, in
-///    `_dl_tlsdesc_dynamic` — it reads a thread-local from a dlopen'd module,
-///    and the fresh TLS block cannot resolve a dynamic TLS descriptor. The
-///    manager refuses to start under Cyclone rather than crash later.
+///  * `rmw_fastrtps_cpp` and `rmw_zenoh_cpp` each run a node to completion in a
+///    clone child, including a second node loaded while the first is spinning,
+///    and shut down clean.
+///  * `rmw_cyclonedds_cpp` **dies** inside `dds_take`, in `_dl_tlsdesc_dynamic`
+///    — it reads a thread-local from a dlopen'd module, and the fresh TLS block
+///    cannot resolve a dynamic TLS descriptor. The manager refuses to start
+///    under Cyclone rather than crash later.
 ///  * A child may only be stopped by `executor->cancel()`. A signal leaves
 ///    whatever rclcpp or DDS mutex it held locked forever in the address space
 ///    the parent shares, and the container then deadlocks in shutdown.

@@ -10,11 +10,13 @@ find_package(composition_interfaces REQUIRED)
 find_package(play_launch_msgs REQUIRED)
 find_package(class_loader REQUIRED)
 find_package(ament_index_cpp REQUIRED)
+find_package(rmw REQUIRED)
 
-# Shared library (both component manager classes)
+# Shared library (all three component manager classes)
 add_library(observable_component_manager SHARED
   src/observable_component_manager.cpp
   src/clone_isolated_component_manager.cpp
+  src/clone_vm_component_manager.cpp
   src/control_channel.cpp
   src/control_json.cpp)
 target_include_directories(observable_component_manager PUBLIC
@@ -22,6 +24,15 @@ target_include_directories(observable_component_manager PUBLIC
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
 ament_target_dependencies(observable_component_manager
   rclcpp rclcpp_components composition_interfaces play_launch_msgs)
+# _dl_allocate_tls and __ctype_init are reached through dlsym at runtime, and
+# rmw_get_implementation_identifier decides whether clone-vm may run at all.
+target_link_libraries(observable_component_manager ${CMAKE_DL_LIBS})
+ament_target_dependencies(observable_component_manager rmw)
+# The clone-vm child bootstrap writes into struct pthread at an offset found at
+# runtime, immediately after crossing the clone boundary. Do not let the
+# optimiser move those stores.
+set_source_files_properties(src/clone_vm_component_manager.cpp
+  PROPERTIES COMPILE_OPTIONS "-O1")
 
 # Phase 64: control-channel unit tests (JSON codec + framing invariants).
 if(BUILD_TESTING)

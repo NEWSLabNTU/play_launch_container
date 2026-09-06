@@ -52,13 +52,14 @@ namespace play_launch_container
 /// It is selected by `--container-mode clone-vm`, which clap does not print.
 /// Three things are measured and one large one is not:
 ///
-///  * `rmw_fastrtps_cpp` and `rmw_zenoh_cpp` each run a node to completion in a
-///    clone child, including a second node loaded while the first is spinning,
-///    and shut down clean.
-///  * `rmw_cyclonedds_cpp` **dies** inside `dds_take`, in `_dl_tlsdesc_dynamic`
-///    — it reads a thread-local from a dlopen'd module, and the fresh TLS block
-///    cannot resolve a dynamic TLS descriptor. The manager refuses to start
-///    under Cyclone rather than crash later.
+///  * All three shipped RMWs — `rmw_fastrtps_cpp`, `rmw_cyclonedds_cpp` and
+///    `rmw_zenoh_cpp` — run a node to completion in a clone child, including a
+///    second node loaded while the first is spinning, and shut down clean.
+///    Cyclone was refused here for a while on the strength of a crash inside
+///    `dds_take`; that crash was this manager's own wrong thread pointer, not
+///    the backend's fault. See `add_node_to_executor`.
+///  * A SIGSEGV in one child kills only that child, but ONLY because the child
+///    is made undumpable first — see `child_main`.
 ///  * A child may only be stopped by `executor->cancel()`. A signal leaves
 ///    whatever rclcpp or DDS mutex it held locked forever in the address space
 ///    the parent shares, and the container then deadlocks in shutdown.
@@ -85,8 +86,9 @@ public:
 
   /// True when this manager can run on the RMW currently loaded.
   ///
-  /// Static rather than a constructor check so `main` can refuse before
-  /// `rclcpp::init`, and report why, instead of dying in a child later.
+  /// Refuses nothing today — all three shipped backends are measured working.
+  /// Kept because the next backend tried here deserves the same
+  /// "measured / not measured" answer, reported through `reason_out`.
   static bool rmw_is_supported(std::string * reason_out);
 
 protected:

@@ -236,36 +236,26 @@ bool CloneVmComponentManager::rmw_is_supported(std::string * reason_out)
   const char * id = rmw_get_implementation_identifier();
   const std::string rmw = id ? id : "";
 
-  // Cyclone reads a thread-local from a dlopen'd module on its take path. That
-  // goes through a dynamic TLS descriptor, whose resolver walks the calling
-  // thread's DTV, and a `_dl_allocate_tls` block is not in a state it accepts.
-  // The child dies on the first message taken -- observed as a SIGSEGV in
-  // `_dl_tlsdesc_dynamic` under `dds_take`, and on a later run as a SIGABRT
-  // from "double free or corruption". That the symptom moves is itself the
-  // signature: a corrupted TLS block does not fail the same way twice.
-  // Refuse up front rather than crash on the first subscription.
-  if (rmw.find("cyclonedds") != std::string::npos) {
-    if (reason_out) {
-      *reason_out =
-        "rmw_cyclonedds_cpp dies in a clone(CLONE_VM) child on the first message taken: "
-        "_dl_tlsdesc_dynamic under dds_take. Use rmw_fastrtps_cpp or rmw_zenoh_cpp, "
-        "or --container-mode isolated.";
-    }
-    return false;
-  }
+  // No backend is refused any more.
+  //
+  // This function used to reject rmw_cyclonedds_cpp, on the evidence that its
+  // children died inside `dds_take`. That evidence was real and the diagnosis
+  // was wrong: the fault was a thread pointer this manager computed
+  // incorrectly, and Cyclone was simply the only backend that read a
+  // thread-local out of a dlopen'd module often enough to notice. With the
+  // thread pointer fixed, all three shipped RMWs pass the reproducer over
+  // repeated runs.
+  //
+  // Kept as a hook rather than deleted, because the next backend to be tried
+  // here deserves the same "measured / not measured" honesty.
+  const bool measured = rmw.find("fastrtps") != std::string::npos ||
+                        rmw.find("cyclonedds") != std::string::npos ||
+                        rmw.find("zenoh") != std::string::npos;
 
-  // Measured working end to end, including a node loaded while another is
-  // spinning and a SIGSEGV that killed only the child that raised it.
-  const bool measured =
-    rmw.find("fastrtps") != std::string::npos || rmw.find("zenoh") != std::string::npos;
-
-  // Anything else is unmeasured rather than known-bad. Say so and continue:
-  // this mode exists to be evaluated, and refusing an untested backend would
-  // prevent the evaluation it is for.
   if (!measured && reason_out) {
     *reason_out = "rmw '" + rmw +
-                  "' has not been tested under clone(CLONE_VM); rmw_fastrtps_cpp and "
-                  "rmw_zenoh_cpp have. Proceeding anyway.";
+                  "' has not been tested under clone(CLONE_VM); rmw_fastrtps_cpp, "
+                  "rmw_cyclonedds_cpp and rmw_zenoh_cpp have. Proceeding anyway.";
   }
   return true;
 }
@@ -282,9 +272,20 @@ void CloneVmComponentManager::add_node_to_executor(uint64_t node_id)
     RCLCPP_ERROR(get_logger(), "node %lu: _dl_allocate_tls failed", node_id);
     return;
   }
-  // CLONE_SETTLS wants the value the thread pointer should take, which is the
-  // struct-pthread address adjusted back across the variant gap.
-  void * child_tp = reinterpret_cast<char *>(tls) - g_pd_from_tp;
+  // `_dl_allocate_tls` returns the TCB address, which IS the value the thread
+  // pointer should take. Pass it to CLONE_SETTLS unchanged.
+  //
+  // Adjusting it by the struct-pthread gap -- treating the return as a
+  // `struct pthread *` -- is the bug that made this look like an RMW problem.
+  // On aarch64 the DTV pointer lives at TP[0], so a thread pointer that is off
+  // by the gap reads a NULL DTV, and every DYNAMIC TLS access faults in
+  // `_dl_tlsdesc_dynamic`. Static and initial-exec TLS are addressed as
+  // TP + offset and need no DTV, so malloc, errno and ctype all appear to work
+  // and the damage stays hidden until something reads a thread-local out of a
+  // dlopen'd module. CycloneDDS does exactly that on its take path, which is
+  // why it alone crashed; measured as `ldr x2, [x0]` with x0 = 0 inside the
+  // descriptor resolver. See experiments/clone-vm-rmw/README.md.
+  void * child_tp = tls;
 
   void * stack = mmap(
     nullptr, kChildStackSize, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1,

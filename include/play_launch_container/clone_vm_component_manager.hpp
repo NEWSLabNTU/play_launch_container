@@ -51,15 +51,12 @@ namespace play_launch_container
 ///
 /// It is selected by `--container-mode clone-vm`, which clap does not print.
 ///
-/// **It does not work on a real Autoware stack yet.** On the golf cart's 142
-/// nodes, eleven of sixteen containers died within seconds of their first clone
-/// child spinning, on
-///
-///     pthread_mutex_lock.c:94: Assertion `mutex->__data.__owner == 0' failed.
-///
-/// and only 18 of 82 composables loaded, against 62 under `observable`. What
-/// follows was all measured on a two-node fixture, which turned out not to be
-/// representative. Treat this mode as a study, not an option.
+/// On the golf cart's 142-node stack it now loads the same 62 of 82 composables
+/// as `observable`, with no assertions and no heap corruption, for 12.8 points
+/// less host CPU and 95 fewer threads. Getting there took two fixes that are
+/// only correct together — see `add_node_to_executor` and `child_main`, and
+/// `experiments/clone-vm-rmw/README.md` for how the first one made the second
+/// one bite. One run per mode, so treat the size as indicative.
 ///
 /// Three things are measured and one large one is not:
 ///

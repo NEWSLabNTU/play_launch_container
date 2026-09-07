@@ -272,6 +272,29 @@ void CloneVmComponentManager::add_node_to_executor(uint64_t node_id)
     RCLCPP_ERROR(get_logger(), "node %lu: _dl_allocate_tls failed", node_id);
     return;
   }
+  // `_dl_allocate_tls` allocates through `__libc_memalign` and clears only the
+  // TCB itself -- on aarch64 that is 16 bytes at the thread pointer, holding
+  // the DTV. The `struct pthread` sitting BELOW the thread pointer is left as
+  // whatever the allocator last had there.
+  //
+  // `pthread_create` never sees that: it takes its stack from a fresh mmap, so
+  // a real thread's `struct pthread` starts life zeroed. A clone child built
+  // this way inherits garbage in every field `start_thread` would have set --
+  // robust_list, cancelhandling, the stack-cache list pointers, and more.
+  //
+  // Zero it, so the child starts from the same state a pthread would. This is
+  // not optional: without it a real Autoware node corrupts the heap within
+  // milliseconds of its child spinning ("malloc(): unsorted double linked list
+  // corrupted", or an assertion inside pthread_mutex_lock).
+  //
+  // Only the region below the thread pointer: the TCB at [tp, tp+16) already
+  // holds the DTV that _dl_allocate_tls installed, and clearing that would
+  // undo the one thing it did initialise.
+  if (g_pd_from_tp < 0) {
+    std::memset(
+      reinterpret_cast<char *>(tls) + g_pd_from_tp, 0, static_cast<std::size_t>(-g_pd_from_tp));
+  }
+
   // `_dl_allocate_tls` returns the TCB address, which IS the value the thread
   // pointer should take. Pass it to CLONE_SETTLS unchanged.
   //

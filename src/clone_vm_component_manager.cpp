@@ -135,11 +135,30 @@ int child_main(void * arg)
 {
   auto * boot = static_cast<ChildBootstrap *>(arg);
 
+  char * pd = reinterpret_cast<char *>(thread_pointer()) + g_pd_from_tp;
+
+  // `struct pthread.header.multiple_threads`, at offset 0. THIS ONE IS NOT
+  // OPTIONAL, and getting it wrong corrupts the heap rather than failing.
+  //
+  // glibc reads it to decide whether the process is single-threaded, and takes
+  // an unlocked fast path when it is -- `__libc_malloc` calls `_int_malloc`
+  // WITHOUT taking the arena lock under `SINGLE_THREAD_P`. A clone child whose
+  // `struct pthread` we just zeroed reads 0 there, concludes it is alone, and
+  // allocates unlocked while every thread in the parent is allocating too.
+  //
+  // The symptoms are whatever the race happens to break that run:
+  //   malloc.c:4302: _int_malloc: Assertion `(size) >= (nb)' failed
+  //   malloc(): unsorted double linked list corrupted
+  //   pthread_mutex_lock.c:94: Assertion `mutex->__data.__owner == 0' failed
+  // all three observed from the same build. Measured on this glibc:
+  // `*(int *) pthread_self()` is 0 before any thread exists and 1 after
+  // `pthread_create`, which is what a clone child must look like.
+  *reinterpret_cast<int *>(pd) = 1;
+
   // Our own identity in the fresh TLS block. glibc's mutex ownership checks
   // and pthread_create read it, and without this the block still carries
   // whatever tid the allocation inherited.
   if (g_tid_offset >= 0) {
-    char * pd = reinterpret_cast<char *>(thread_pointer()) + g_pd_from_tp;
     const auto tid = static_cast<pid_t>(syscall(SYS_gettid));
     std::memcpy(pd + g_tid_offset, &tid, sizeof tid);
   }

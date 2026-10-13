@@ -59,8 +59,7 @@ static void write_ready(int fd, const std::string & msg)
 // because ament_index_cpp's API is not stable across distributions: Rolling
 // changed get_resource to return a struct and renamed get_search_paths.
 static bool find_resource(
-  const std::string & type, const std::string & name, std::string & content,
-  std::string & prefix)
+  const std::string & type, const std::string & name, std::string & content, std::string & prefix)
 {
   const char * env = std::getenv("AMENT_PREFIX_PATH");
   std::istringstream paths(env ? env : "");

@@ -22,12 +22,17 @@ add_library(observable_component_manager SHARED
 target_include_directories(observable_component_manager PUBLIC
   "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   "$<INSTALL_INTERFACE:include/${PROJECT_NAME}>")
-ament_target_dependencies(observable_component_manager
-  rclcpp rclcpp_components composition_interfaces play_launch_msgs)
+# Modern CMake targets instead of ament_target_dependencies, which Rolling
+# removed. Message packages export ${pkg_TARGETS}; libraries export pkg::lib.
+target_link_libraries(observable_component_manager
+  rclcpp::rclcpp
+  rclcpp_components::component
+  rclcpp_components::component_manager
+  ${composition_interfaces_TARGETS}
+  ${play_launch_msgs_TARGETS})
 # _dl_allocate_tls and __ctype_init are reached through dlsym at runtime, and
 # rmw_get_implementation_identifier decides whether clone-vm may run at all.
-target_link_libraries(observable_component_manager ${CMAKE_DL_LIBS})
-ament_target_dependencies(observable_component_manager rmw)
+target_link_libraries(observable_component_manager rmw::rmw ${CMAKE_DL_LIBS})
 # The clone-vm child bootstrap writes into struct pthread at an offset found at
 # runtime, immediately after crossing the clone boundary. Do not let the
 # optimiser move those stores.
@@ -47,20 +52,23 @@ endif()
 
 # SlowLoader test component (shared library for composition)
 add_library(slow_loader SHARED src/slow_loader.cpp)
-ament_target_dependencies(slow_loader rclcpp rclcpp_components)
+target_link_libraries(slow_loader rclcpp::rclcpp rclcpp_components::component)
 rclcpp_components_register_node(slow_loader
   PLUGIN "play_launch_container::SlowLoader"
   EXECUTABLE slow_loader_node)
 
 # Container executable (single binary, configurable via CLI flags)
 add_executable(component_container src/component_container.cpp)
-target_link_libraries(component_container observable_component_manager)
-ament_target_dependencies(component_container rclcpp)
+target_link_libraries(component_container observable_component_manager rclcpp::rclcpp)
 
 # Standalone node binary (fork+exec'd by CloneIsolatedComponentManager)
 add_executable(component_node src/component_node.cpp)
-ament_target_dependencies(component_node
-  rclcpp rclcpp_components class_loader ament_index_cpp)
+target_link_libraries(component_node
+  rclcpp::rclcpp
+  rclcpp_components::component
+  rclcpp_components::component_manager
+  class_loader::class_loader
+  ament_index_cpp::ament_index_cpp)
 
 install(TARGETS observable_component_manager slow_loader
   ARCHIVE DESTINATION lib

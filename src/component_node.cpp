@@ -30,11 +30,12 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
-#include "ament_index_cpp/get_resource.hpp"
 #include "class_loader/class_loader.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_components/node_factory.hpp"
@@ -51,6 +52,34 @@ static void write_ready(int fd, const std::string & msg)
     written += static_cast<size_t>(n);
   }
   close(fd);
+}
+
+// Look up an ament index resource: the first prefix on AMENT_PREFIX_PATH
+// holding share/ament_index/resource_index/<type>/<name>. Done by hand
+// because ament_index_cpp's API is not stable across distributions: Rolling
+// changed get_resource to return a struct and renamed get_search_paths.
+static bool find_resource(
+  const std::string & type, const std::string & name, std::string & content,
+  std::string & prefix)
+{
+  const char * env = std::getenv("AMENT_PREFIX_PATH");
+  std::istringstream paths(env ? env : "");
+  std::string search_path;
+  while (std::getline(paths, search_path, ':')) {
+    if (search_path.empty()) {
+      continue;
+    }
+    std::ifstream file(search_path + "/share/ament_index/resource_index/" + type + "/" + name);
+    if (!file) {
+      continue;
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    content = buffer.str();
+    prefix = search_path;
+    return true;
+  }
+  return false;
 }
 
 int main(int argc, char * argv[])
@@ -115,7 +144,7 @@ int main(int argc, char * argv[])
   // Find the plugin shared library via ament index
   std::string content;
   std::string prefix;
-  if (!ament_index_cpp::get_resource("rclcpp_components", package_name, content, &prefix)) {
+  if (!find_resource("rclcpp_components", package_name, content, prefix)) {
     std::string err = "No rclcpp_components index for package '" + package_name + "'";
     if (ready_fd >= 0) {
       write_ready(ready_fd, "ERR " + err);

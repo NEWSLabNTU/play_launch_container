@@ -9,7 +9,6 @@ find_package(rclcpp_components REQUIRED)
 find_package(composition_interfaces REQUIRED)
 find_package(play_launch_msgs REQUIRED)
 find_package(class_loader REQUIRED)
-find_package(ament_index_cpp REQUIRED)
 find_package(rmw REQUIRED)
 
 # Shared library (all three component manager classes)
@@ -67,8 +66,7 @@ target_link_libraries(component_node
   rclcpp::rclcpp
   rclcpp_components::component
   rclcpp_components::component_manager
-  class_loader::class_loader
-  ament_index_cpp::ament_index_cpp)
+  class_loader::class_loader)
 
 install(TARGETS observable_component_manager slow_loader
   ARCHIVE DESTINATION lib

@@ -130,6 +130,10 @@ private:
     uint64_t node_id, const std::shared_ptr<LoadNode::Request> & request);
 
   void cleanup_child(ChildInfo & child);
+
+  /// Stop every child at once at container shutdown: SIGTERM to all, then
+  /// wait for all on one deadline, then SIGKILL what is left.
+  void terminate_children();
   void monitor_loop();
   void handle_child_death(uint64_t node_id);
 

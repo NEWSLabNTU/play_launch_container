@@ -338,18 +338,6 @@ CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
     control_->stop();
   }
 
-  // Stop worker threads first (they may hold load_mutex_)
-  {
-    std::lock_guard<std::mutex> lock(work_queue_mutex_);
-    workers_running_ = false;
-  }
-  work_queue_cv_.notify_all();
-  for (auto & t : worker_threads_) {
-    if (t.joinable()) {
-      t.join();
-    }
-  }
-
   // Stop monitor thread before cleaning up children
   if (monitor_thread_.joinable()) {
     monitor_running_ = false;
@@ -362,6 +350,30 @@ CloneIsolatedComponentManager::~CloneIsolatedComponentManager()
     monitor_thread_.join();
   }
 
+  // Children BEFORE the worker threads. Each child was forked by a worker
+  // and armed with PR_SET_PDEATHSIG, which fires when the forking THREAD
+  // exits, not the process — so joining the workers first SIGKILLed every
+  // child a few milliseconds into its own SIGTERM handling (seen under
+  // strace). A child killed that way never tears down its DDS participant:
+  // it leaves its shared-memory files behind, and every peer still shutting
+  // down waits on its dead ports, which is what made whole Autoware stacks
+  // overrun the launcher's SIGTERM grace.
+  terminate_children();
+
+  // Stop worker threads (they may hold load_mutex_)
+  {
+    std::lock_guard<std::mutex> lock(work_queue_mutex_);
+    workers_running_ = false;
+  }
+  work_queue_cv_.notify_all();
+  for (auto & t : worker_threads_) {
+    if (t.joinable()) {
+      t.join();
+    }
+  }
+
+  // A worker that finished a spawn during shutdown cleans its child up
+  // itself; this catches anything registered after terminate_children().
   {
     std::lock_guard<std::mutex> lock(children_mutex_);
     for (auto & [node_id, child] : children_) {
@@ -1618,6 +1630,73 @@ void CloneIsolatedComponentManager::handle_child_death(uint64_t node_id)
   }
 
   children_.erase(it);
+}
+
+// ── terminate_children (container shutdown) ────────────────────────────
+
+void CloneIsolatedComponentManager::terminate_children()
+{
+  // As long as `launch`'s default sigterm_timeout: a child gets the time a
+  // node launched on its own would get before SIGKILL.
+  constexpr auto kStopTimeout = std::chrono::seconds(5);
+
+  std::map<uint64_t, ChildInfo> children;
+  {
+    std::lock_guard<std::mutex> lock(children_mutex_);
+    children.swap(children_);
+  }
+  // A child still constructing belongs to the worker waiting on its ready
+  // pipe, which reaps it; it only needs the signal.
+  std::vector<pid_t> constructing;
+  {
+    std::lock_guard<std::mutex> lock(pending_mutex_);
+    for (const auto & [node_id, load] : pending_loads_) {
+      if (load.phase == LoadPhase::Constructing && load.pid > 0) {
+        constructing.push_back(load.pid);
+      }
+    }
+  }
+
+  // All at once. One at a time with a wait each, a container of N slow
+  // children took N times as long, and the ones at the back of the queue
+  // were the ones the launcher's own deadline caught.
+  for (auto & [node_id, child] : children) {
+    kill(child.pid, SIGTERM);
+  }
+  for (pid_t pid : constructing) {
+    kill(pid, SIGTERM);
+  }
+
+  std::vector<pid_t> alive;
+  for (auto & [node_id, child] : children) {
+    alive.push_back(child.pid);
+  }
+  const auto deadline = std::chrono::steady_clock::now() + kStopTimeout;
+  while (!alive.empty() && std::chrono::steady_clock::now() < deadline) {
+    alive.erase(
+      std::remove_if(
+        alive.begin(), alive.end(), [](pid_t pid) { return waitpid(pid, nullptr, WNOHANG) != 0; }),
+      alive.end());
+    if (!alive.empty()) {
+      usleep(10000);
+    }
+  }
+  for (pid_t pid : alive) {
+    RCLCPP_WARN(
+      get_logger(), "Component process %d ignored SIGTERM for %ds; sending SIGKILL", pid,
+      static_cast<int>(kStopTimeout.count()));
+    kill(pid, SIGKILL);
+    waitpid(pid, nullptr, 0);
+  }
+
+  for (auto & [node_id, child] : children) {
+    if (child.pidfd >= 0) {
+      close(child.pidfd);
+    }
+    if (!child.param_file.empty()) {
+      unlink(child.param_file.c_str());
+    }
+  }
 }
 
 // ── cleanup_child (destructor / unload helper) ──────────────────────────

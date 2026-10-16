@@ -1657,14 +1657,33 @@ void CloneIsolatedComponentManager::terminate_children()
     }
   }
 
-  // All at once. One at a time with a wait each, a container of N slow
-  // children took N times as long, and the ones at the back of the queue
-  // were the ones the launcher's own deadline caught.
+  // Staggered, never waited on. One at a time with a wait each, a container
+  // of N slow children took N times as long, and the ones at the back of
+  // the queue were the ones the launcher's own deadline caught. All at once
+  // has its own cost: Fast DDS 2.6 sometimes crashes or hangs a node in
+  // rcl_node_fini when many participants leave together (a race in
+  // EDP::unpairWriterProxy), and each such node leaves its shared-memory
+  // files behind. So the signals go out 5 ms apart, the whole container in
+  // at most 1 s — the rule play_launch applies to a process group
+  // (process/pgid.rs, stop_process_group_staggered). play_launch stops a
+  // container's children itself before the container; this covers every
+  // other way a container is stopped (the web UI, a respawn, `ros2 launch`).
+  constexpr auto kStaggerStep = std::chrono::milliseconds(5);
+  constexpr auto kStaggerBudget = std::chrono::milliseconds(1000);
+  std::vector<pid_t> to_signal;
   for (auto & [node_id, child] : children) {
-    kill(child.pid, SIGTERM);
+    to_signal.push_back(child.pid);
   }
-  for (pid_t pid : constructing) {
-    kill(pid, SIGTERM);
+  to_signal.insert(to_signal.end(), constructing.begin(), constructing.end());
+  const auto step = to_signal.empty() ? kStaggerStep
+                                      : std::min<std::chrono::microseconds>(
+                                          kStaggerStep, std::chrono::microseconds(kStaggerBudget) /
+                                                          static_cast<int64_t>(to_signal.size()));
+  for (size_t i = 0; i < to_signal.size(); ++i) {
+    if (i > 0) {
+      std::this_thread::sleep_for(step);
+    }
+    kill(to_signal[i], SIGTERM);
   }
 
   std::vector<pid_t> alive;
